@@ -23,10 +23,11 @@ Three facts, established by measurement on a Pi 4, make a decision layer
 *outside* a single ffmpeg process necessary:
 
 - **Concurrency is unmanaged.** rpivid itself is not exclusive (two concurrent HW
-  decodes run fine), but CMA is the real limit: one 4K session fits in the Pi 4's
-  512 MB CMA, two exhaust it. Each ffmpeg decides in isolation, so nothing stops a
-  second 4K session from starting and failing. A single process cannot arbitrate a
-  global resource — an admission gate has to live above ffmpeg.
+  decodes run fine), but CMA is the real limit: a 4K hardware decode needs a large
+  contiguous allocation, and how many fit depends on how much CMA *you* gave the
+  board. Each ffmpeg decides in isolation, so nothing stops one more 4K session
+  from starting and failing. A single process cannot arbitrate a global resource —
+  an admission gate has to live above ffmpeg.
 - **The RPi fork isn't in Jellyfin's playback path.** Jellyfin runs the distro
   `jellyfin-ffmpeg`; the 8.x fork carrying the RPi work
   ([poizan42/jellyfin-rpi-ffmpeg](https://github.com/poizan42/jellyfin-rpi-ffmpeg)
@@ -115,7 +116,17 @@ loud and land where it can be fixed: in the fork build, or in these rules.
 `flock(LOCK_EX|LOCK_NB)`, then **clears `FD_CLOEXEC`** so the lock is inherited by
 the exec'd ffmpeg and held for that process's whole life. The kernel releases it
 automatically on exit or SIGKILL — no daemon, no stale state, no cleanup path to
-get wrong. `hw_slots = 1` reflects the measured 1×4K-fits / 2×4K-exhausts result.
+get wrong.
+
+**`hw_slots` is yours to tune** — it is the shim's model of *your* CMA budget, and
+CMA size is a boot-time tradeoff against normal system RAM that only you can make
+(`cma=` on the kernel command line). The shipped `hw_slots = 1` is what was
+measured at `cma=512M` on a Pi 4: one 4K HEVC session fits, two exhaust it. Give
+the board more CMA and you can raise it; give it less and the hardware rules
+simply stop firing, leaving every session on the software-decode fallback —
+slower, but never a CMA failure. There is no autodetection: `CmaFree` is a
+famously misleading number (it counts pages that are movable-but-not-free), so
+the shim asks you for a slot count instead of guessing one.
 
 ## The rule file (`rules.toml`)
 
@@ -283,7 +294,10 @@ a one-line reversible hook instead of a server rebuild.
   repo's README → "Building"); `check-encoders.sh` enforces it.
 - The stock `jellyfin-ffmpeg` package, kept in place for passthrough.
 - Python 3.11+ (`tomllib`); no third-party modules.
-- `cma=512M` on the kernel command line for 4K HEVC decode.
+- Enough CMA for what you want to run in hardware. 4K HEVC decode needs a big
+  contiguous pool; the numbers here were measured at `cma=512M` on a Pi 4, but the
+  size is a tradeoff against normal system RAM and is yours to choose — set it on
+  the kernel command line and match `hw_slots` in `rules.toml` to it.
 
 ## Provenance
 

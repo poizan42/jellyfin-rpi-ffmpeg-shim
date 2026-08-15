@@ -45,8 +45,13 @@ hw_encoders = ["h264_v4l2m2m", "hevc_v4l2m2m"]
 # on the Pi 4, so libx265 is intentionally absent: it passes through.)
 h264_sw_encoders = ["libx264", "libopenh264", "h264"]
 
-# Concurrent hardware-decode sessions permitted. 1 x 4K fits in the Pi 4's
-# 512 MB CMA; 2 x 4K exhaust it (measured). Slot files live in slot_dir.
+# Concurrent hardware-decode sessions permitted. TUNE THIS to the CMA you have
+# given the board: CMA size is a boot-time tradeoff against normal system RAM
+# that only you can make, and it sets how many 4K hardware decodes can coexist.
+# The default of 1 is what was measured at cma=512M on a Pi 4 (one 4K session
+# fits, two exhaust it). More CMA -> raise it; less -> the hardware rules simply
+# never fire and everything takes the software-decode fallback. Slot files live
+# in slot_dir.
 hw_slots = 1
 slot_dir = "/tmp/rpi-orch-slots"
 
