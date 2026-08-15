@@ -128,6 +128,13 @@ time:
 ./check-capabilities.sh
 ```
 
+**A gotcha this check exists to catch:** jellyfin-ffmpeg ships much of what it
+does as a **quilt series in `debian/patches/`, applied at Debian build time** —
+not in its git tree. Build a fork of it straight from the tree and you silently
+get *none* of it, including `tonemapx`, the filter Jellyfin puts in its software
+HDR chains. The fork this shim targets applies that series in-tree for exactly
+this reason. If you build your own, apply it too, or this check will tell you.
+
 **The shim deliberately has no runtime capability check.** Detecting a gap at
 transcode time and routing around it would convert a build defect into a quiet
 regression — playback keeps working, slower, and nobody notices the fork is broken
