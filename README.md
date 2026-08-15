@@ -100,7 +100,7 @@ hardware, nonfree, dead formats). `install.sh` runs it and **refuses to deploy**
 an unexplained gap (`SKIP_ENCODER_CHECK=1` overrides). Run it any time:
 
 ```bash
-transcode-orchestrator/check-encoders.sh
+./check-encoders.sh
 ```
 
 **The shim deliberately has no runtime encoder-availability check.** Detecting the
