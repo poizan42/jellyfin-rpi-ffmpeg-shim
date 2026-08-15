@@ -1,4 +1,6 @@
 #!/bin/bash
+# SPDX-License-Identifier: MIT
+# Copyright (c) 2026 Kasper Fabæch Brandt
 # Diff the fork ffmpeg's encoder list against the stock jellyfin-ffmpeg's.
 #
 # Why: the shim rewrites only the *video* side of Jellyfin's graph and passes

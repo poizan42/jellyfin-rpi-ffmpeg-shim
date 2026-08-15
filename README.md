@@ -323,3 +323,10 @@ Extracted from a private research repo where it was developed alongside the ffmp
 fork, so history starts at the extraction. Every number quoted here
 (1×4K-fits/2×4K-exhausts, the per-rule CPU costs, the ~6% exact-half win) was
 measured on a Pi 4B, not estimated.
+
+## License
+
+MIT — see [LICENSE](LICENSE). Copyright (c) 2026 Kasper Fabæch Brandt.
+
+(The ffmpeg fork it drives is a separate project under FFmpeg's own licence; this
+repo contains no FFmpeg code.)

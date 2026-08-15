@@ -1,4 +1,6 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: MIT
+# Copyright (c) 2026 Kasper Fabæch Brandt
 """Pure golden-rewrite tests for the orchestrator shim. No hardware, no exec.
 
 Run: python3 tests/test_rewrite.py   (from the transcode-orchestrator dir)

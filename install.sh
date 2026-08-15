@@ -1,4 +1,6 @@
 #!/bin/bash
+# SPDX-License-Identifier: MIT
+# Copyright (c) 2026 Kasper Fabæch Brandt
 # Install the orchestrator shim to a root-owned, world-traversable prefix so the
 # Jellyfin service user can execute it — a checkout under a home directory is
 # typically mode 0700, which the `jellyfin` user cannot even traverse (this

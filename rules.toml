@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: MIT
+# Copyright (c) 2026 Kasper Fabæch Brandt
 # rpi-ffmpeg transcode orchestrator — rules (v1)
 #
 # The shim (bin/ffmpeg) evaluates these when Jellyfin asks it to run a video

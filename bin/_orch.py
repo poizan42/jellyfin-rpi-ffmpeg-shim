@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: MIT
+# Copyright (c) 2026 Kasper Fabæch Brandt
 """Shared helpers for the rpi-ffmpeg transcode orchestrator shim.
 
 Kept dependency-free (stdlib only, tomllib is 3.11+). Both bin/ffmpeg and

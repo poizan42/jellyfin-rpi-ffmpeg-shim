@@ -1,4 +1,6 @@
 #!/usr/bin/env python3
+# SPDX-License-Identifier: MIT
+# Copyright (c) 2026 Kasper Fabæch Brandt
 """ffprobe passthrough.
 
 Jellyfin derives the ffprobe path from the --ffmpeg path by regex

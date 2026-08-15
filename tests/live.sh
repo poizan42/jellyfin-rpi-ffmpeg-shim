@@ -1,4 +1,6 @@
 #!/bin/bash
+# SPDX-License-Identifier: MIT
+# Copyright (c) 2026 Kasper Fabæch Brandt
 # Live end-to-end checks for the shim. Requires the RPi hardware + fork build.
 # Not run in CI; run manually on the Pi.
 #
