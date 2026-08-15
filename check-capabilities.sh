@@ -36,17 +36,16 @@ STOCK="${2:-/usr/lib/jellyfin-ffmpeg/ffmpeg}"
 # justified — every entry is a promise that Jellyfin will never need it here.
 #   *_nvenc/_cuvid/_rkmpp/_qsv/_vaapi/_amf, cuda/opencl/rkrga filters
 #                          : other vendors' hardware, unusable on a Pi
-#   libfdk_aac             : nonfree. NOTE this one is only safe because Jellyfin
-#                            asks for what it PROBED: it runs `-encoders` through
-#                            the shim, which now reaches this fork, so it stops
-#                            offering libfdk_aac and picks native aac. That is a
-#                            restart-scoped belief -- Jellyfin caches the probe at
-#                            startup. Change the fork's capabilities without
-#                            restarting Jellyfin and it will keep asking for what
-#                            the old probe found, and the transcode dies with
-#                            "Unknown encoder". Restart Jellyfin after install.
 #   libsvtav1 / libtheora  : no AV1 encode target here; theora is dead
 #   sonic / sonicls        : experimental encoders, never selected
+#
+# libfdk_aac used to sit in this list, justified as "nonfree, native aac covers
+# it". That was wrong twice over: Jellyfin's own build ships it (their patch
+# 0026 reclassifies it as free, so no --enable-nonfree is needed) and Jellyfin
+# *prefers* it for AAC output — so a real transcode died with "Unknown encoder".
+# The fork builds it now. Lesson for anything you add here: an entry is only
+# safe if Jellyfin will never ASK for it, and Jellyfin asks based on the
+# capabilities it probed at startup — not on what it needs.
 #
 # ...plus things upstream REMOVED after the stock build's version. The fork
 # tracks a newer FFmpeg than the packaged jellyfin-ffmpeg (8.x vs 7.x), so the
@@ -57,7 +56,7 @@ STOCK="${2:-/usr/lib/jellyfin-ffmpeg/ffmpeg}"
 #                 ("Remove the old HLS protocol handler"); the hls muxer and
 #                 demuxer, which is what Jellyfin actually uses, are present
 #   openclsrc   : OpenCL source filter; we build no OpenCL
-EXPECTED_MISSING='_(nvenc|cuvid|rkmpp|rkrga|qsv|vaapi|amf|cuda|opencl)$|^(cuda|opencl|rkmpp)$|^libfdk_aac$|^libsvtav1$|^libtheora$|^sonic(ls)?$|^pp$|^hls$|^openclsrc$'
+EXPECTED_MISSING='_(nvenc|cuvid|rkmpp|rkrga|qsv|vaapi|amf|cuda|opencl)$|^(cuda|opencl|rkmpp)$|^libsvtav1$|^libtheora$|^sonic(ls)?$|^pp$|^hls$|^openclsrc$'
 
 # Capability kinds to compare. The listing formats differ per kind AND across
 # FFmpeg versions (8.x dropped the filter "command support" flag, so that column
