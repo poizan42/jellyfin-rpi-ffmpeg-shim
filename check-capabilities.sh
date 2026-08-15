@@ -44,9 +44,10 @@ STOCK="${2:-/usr/lib/jellyfin-ffmpeg/ffmpeg}"
 # tracks a newer FFmpeg than the packaged jellyfin-ffmpeg (8.x vs 7.x), so the
 # diff is not purely "fork is behind" — some entries the stock build has are
 # simply gone from modern FFmpeg and are not coming back:
-#   pp          : libpostproc was removed in FFmpeg 8.0
-#   hls         : the hls *protocol* was removed in 8.0 (the hls muxer and
-#                 demuxer, which is what Jellyfin actually uses, are present)
+#   pp          : libpostproc was removed upstream in the 8.x cycle
+#   hls         : the hls *protocol* was removed upstream in the 8.x cycle
+#                 ("Remove the old HLS protocol handler"); the hls muxer and
+#                 demuxer, which is what Jellyfin actually uses, are present
 #   openclsrc   : OpenCL source filter; we build no OpenCL
 EXPECTED_MISSING='_(nvenc|cuvid|rkmpp|rkrga|qsv|vaapi|amf|cuda|opencl)$|^(cuda|opencl|rkmpp)$|^libfdk_aac$|^libsvtav1$|^libtheora$|^sonic(ls)?$|^pp$|^hls$|^openclsrc$'
 
