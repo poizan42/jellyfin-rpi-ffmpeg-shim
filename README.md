@@ -250,6 +250,15 @@ JELLYFIN_FFMPEG_OPT="--ffmpeg=/opt/rpi-ffmpeg-orchestrator/bin/ffmpeg"
 then `sudo systemctl restart jellyfin`. To revert, restore the original line and
 restart. No server rebuild either way.
 
+> **Restart Jellyfin whenever the fork's capabilities change** — after every
+> `install.sh`, not just the first. Jellyfin probes ffmpeg's encoders and filters
+> **once at startup** and builds every later command line from that cached answer.
+> Swap in a binary with a different feature set under a running server and it will
+> keep asking for what the *old* one had, and those transcodes die with
+> `Unknown encoder`. (This is also why `passthrough_ffmpeg` deserves care: point it
+> at the stock build and Jellyfin probes *that* while engaged commands run on the
+> fork, so the two can disagree by construction.)
+
 **Jellyfin settings this was tested with** (Dashboard → Playback → Transcoding):
 *Hardware acceleration* = **Video4Linux2 (V4L2)**, *hardware decoding* enabled for
 **H264**, *hardware encoding* **off** (so Jellyfin asks for `libx264` and the shim

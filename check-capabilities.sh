@@ -36,7 +36,15 @@ STOCK="${2:-/usr/lib/jellyfin-ffmpeg/ffmpeg}"
 # justified — every entry is a promise that Jellyfin will never need it here.
 #   *_nvenc/_cuvid/_rkmpp/_qsv/_vaapi/_amf, cuda/opencl/rkrga filters
 #                          : other vendors' hardware, unusable on a Pi
-#   libfdk_aac             : nonfree; the native aac encoder/decoder covers it
+#   libfdk_aac             : nonfree. NOTE this one is only safe because Jellyfin
+#                            asks for what it PROBED: it runs `-encoders` through
+#                            the shim, which now reaches this fork, so it stops
+#                            offering libfdk_aac and picks native aac. That is a
+#                            restart-scoped belief -- Jellyfin caches the probe at
+#                            startup. Change the fork's capabilities without
+#                            restarting Jellyfin and it will keep asking for what
+#                            the old probe found, and the transcode dies with
+#                            "Unknown encoder". Restart Jellyfin after install.
 #   libsvtav1 / libtheora  : no AV1 encode target here; theora is dead
 #   sonic / sonicls        : experimental encoders, never selected
 #
