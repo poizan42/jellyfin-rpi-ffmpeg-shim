@@ -1,0 +1,118 @@
+# rpi-ffmpeg transcode orchestrator — rules (v1)
+#
+# The shim (bin/ffmpeg) evaluates these when Jellyfin asks it to run a video
+# transcode whose output encoder is one of `hw_encoders`. First matching rule
+# wins; a rule that needs a hardware slot is skipped if none is free, so the
+# software rule below is the guaranteed fallback.
+#
+# `when` is a Python expression evaluated with NO builtins against a fixed set
+# of facts:
+#   src_codec  src_w  src_h  src_pix_fmt  src_bit_depth  src_chroma  src_hdr
+#   out_w  out_h            (fitted output size, aspect-preserving, /64 x /2)
+#   hw_decodable            (rpivid can decode it: hevc, 4:2:0, 8/10-bit, <=4K)
+#   tm                      (tm_hdr if the SOURCE is HDR -> we tonemap to SDR,
+#                            else "none"; independent of whether Jellyfin asked)
+# `vf` is a Python str.format template over those same facts.
+#
+# NOTE: `when` is eval()'d. This is a local, trusted, root-owned config; if that
+# ever stops being true, replace the evaluator before shipping.
+
+# The shim AUGMENTS the stock build; it does not replace it. Two real binaries:
+#
+#  hw_ffmpeg  — our fork build (has sand_to_yuv420p_drm, scale_v4l2m2m, the SAND
+#               and tonemap work). Used ONLY for the rewritten hardware graph.
+#  ffmpeg     — the full-featured build Jellyfin expects, for EVERY command the
+#               shim does not rewrite (probes, thumbnails, formats we can't do on
+#               hardware). Must have the GPL bits the fork omits (libx264 etc.);
+#               the fork errors on `-x264opts` with "Option not found". The stock
+#               jellyfin-ffmpeg is the right target. Its ffprobe is used for the
+#               shim's own source probe too.
+#
+# install.sh rewrites hw_ffmpeg to the copy it places in the install prefix. In
+# a source tree the shim also falls back to a sibling checkout of the fork
+# (../ffmpeg-jellyfin/ffmpeg) and then to PATH, so this path not existing is not
+# fatal — see real_binary() in bin/_orch.py.
+hw_ffmpeg = "/opt/rpi-ffmpeg-orchestrator/ffmpeg-real"
+ffmpeg    = "/usr/lib/jellyfin-ffmpeg/ffmpeg"
+ffprobe   = "/usr/lib/jellyfin-ffmpeg/ffprobe"
+
+# Encoders that mean "this is a Pi hardware-encode transcode we can optimise".
+hw_encoders = ["h264_v4l2m2m", "hevc_v4l2m2m"]
+
+# Software H.264 encoders redirected to the Pi's hardware H.264 encoder — a
+# software H.264 encode can't keep up in real time, so when Jellyfin asks for
+# libx264 we still route the transcode onto h264_v4l2m2m. (No HW HEVC *encoder*
+# on the Pi 4, so libx265 is intentionally absent: it passes through.)
+h264_sw_encoders = ["libx264", "libopenh264", "h264"]
+
+# Concurrent hardware-decode sessions permitted. 1 x 4K fits in the Pi 4's
+# 512 MB CMA; 2 x 4K exhaust it (measured). Slot files live in slot_dir.
+hw_slots = 1
+slot_dir = "/tmp/rpi-orch-slots"
+
+# Tone-map tier applied when the SOURCE is HDR (we always emit 8-bit SDR H.264):
+#   none      10->8 truncation only (washed-out HDR — not a real tone-map)
+#   fast      separable, real-time, slight colour approximation
+#   veryfast  == fast, EXCEPT Dolby-Vision-P5 on a non-2:1 downscale (e.g. DV P5
+#             -> 720p), where the 3D chroma becomes an ordered-dithered nearest-cell
+#             lookup: +~6% headroom, perceptually ~63 dB vs tetrahedral (sub-visible
+#             grain, deterministic). Identical to `fast` for HDR10/HLG and for any
+#             `out=half` path (both collapse to the tetra path).   <-- default
+#   accurate  3D-LUT, luma-aware, matches zscale (best quality)
+# `veryfast` is the default: a strict superset of `fast` that only ever changes the
+# DV-P5/non-2:1 case, buying real-time headroom there at no perceptible cost while
+# staying byte-identical to `fast` everywhere else. (4K HDR10 -> 720p out=half is
+# ~1.5x / ~2 cores regardless of tier — out=half makes it hardware-gated.) Set
+# `accurate` for best quality on the quality-sensitive DV-P5/720p case.
+tm_hdr = "veryfast"
+
+# --- rules, first match wins -------------------------------------------------
+
+# Exact 2:1 (e.g. 4K -> 1080p): out=half lands on the target, so the ISP scale
+# would be a redundant identity pass. Skipping it measured ~6% faster
+# (1.25x -> 1.33x on a 4K HDR -> 1080p transcode). Must precede the general
+# out=half rule below.
+[[rule]]
+name    = "hw decode, exact half (no ISP scale)"
+when    = "hw_decodable and src_w == 2 * out_w and src_h == 2 * out_h"
+hw_slot = true
+args    = ["-hwaccel", "drm", "-hwaccel_output_format", "drm_prime"]
+vf      = "sand_to_yuv420p_drm=tm={tm}:out=half"
+
+[[rule]]
+name    = "hw decode, large downscale (out=half)"
+when    = "hw_decodable and src_w >= 2 * out_w"
+hw_slot = true
+args    = ["-hwaccel", "drm", "-hwaccel_output_format", "drm_prime"]
+vf      = "sand_to_yuv420p_drm=tm={tm}:out=half,scale_v4l2m2m={out_w}:{out_h}"
+
+[[rule]]
+name    = "hw decode"
+when    = "hw_decodable"
+hw_slot = true
+args    = ["-hwaccel", "drm", "-hwaccel_output_format", "drm_prime"]
+vf      = "sand_to_yuv420p_drm=tm={tm},scale_v4l2m2m={out_w}:{out_h}"
+
+# H.264 (not HEVC): the bcm2835 stateful H.264 decoder (/dev/video10) handles
+# <=1080p 8-bit 4:2:0 progressive. `-no_cvt_hw` makes it emit DRM_PRIME straight
+# into scale_v4l2m2m (ISP) and the h264_v4l2m2m encoder — fully hardware,
+# zero-copy, no SAND unpack and no tone-map (8-bit H.264 is SDR). Measured
+# ~0.2-0.4 cores (vs ~2.9 software, ~1.1 via the sand bridge). No hw_slot: it's a
+# different engine from the 4K-HEVC rpivid path and its 1080p CMA cost is small.
+# Gated on resolution/format only — the decoder is not limited by average bitrate
+# or the SPS level tag (measured fine to 110 Mbps / level 5.0 at 1080p); the
+# 1920x1920 coded-size cap is the sole decode bound, so no bitrate gate is needed.
+[[rule]]
+name    = "h264 hw decode (zero-copy DRM_PRIME -> ISP)"
+when    = "h264_hw_decodable"
+args    = ["-no_cvt_hw", "-c:v", "h264_v4l2m2m"]
+vf      = "scale_v4l2m2m={out_w}:{out_h}"
+
+# Fallback: software decode (no -hwaccel), but the scale + H.264 encode stay on
+# hardware — the adaptive sand filter accepts the software yuv420p frame and
+# re-emits DRM_PRIME for the ISP. Reached when the source can't be hardware
+# decoded, or when no hardware slot is free.
+[[rule]]
+name    = "software decode, hw scale + encode"
+when    = "true"
+vf      = "sand_to_yuv420p_drm=tm={tm},scale_v4l2m2m={out_w}:{out_h}"

@@ -1,0 +1,482 @@
+#!/usr/bin/env python3
+"""rpi-ffmpeg transcode orchestrator shim.
+
+Sits at Jellyfin's --ffmpeg= path. For a recognised video *transcode* it
+probes the source, evaluates a declarative rule file (rules.toml), rewrites the
+hwaccel + filter-graph arguments to route through the RPi hardware pipeline, and
+performs cross-session admission control (an flock slot that survives the exec).
+For anything else — capability probes, thumbnails, trickplay, unrecognised
+command shapes, or any internal error — it execs the real ffmpeg with the
+original arguments unchanged. The shim must never be the reason playback breaks.
+
+The decision logic (parse_argv/extract_box/fit/build_facts/choose/build_argv) is
+pure and unit-tested; main() wires in the real probe, the flock, and the exec.
+"""
+import os
+import re
+import sys
+import json
+import fcntl
+import subprocess
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from _orch import load_config, real_binary, exec_real, log  # noqa: E402
+
+# Filters we cannot faithfully reproduce in our graph — if Jellyfin's chain
+# contains one, leave the whole command to the software path untouched. Also
+# bail if our own filters are already present (don't double-process).
+DISALLOWED = re.compile(
+    r"(?:^|[,;=\s])(?:overlay|subtitles|ass|hwupload|hwmap|hwdownload|"
+    r"yadif|bwdif|w3fdif|estdif|deinterlace|sand_to_yuv420p_drm|scale_v4l2m2m)"
+    r"(?:[=,;\s]|$)")
+
+_CODEC_RE = re.compile(r"^-(?:c|codec|vcodec):v(?::\d+)?$")
+_VF_FLAGS = ("-vf", "-filter:v")
+
+# A "resolution-plausible" integer: excludes the small literals in the scale
+# expression (64, 2) and any stray tiny numbers, keeps real target dimensions.
+_MIN_DIM, _MAX_DIM = 120, 8192
+
+# Software H.264 encoders we transparently redirect to the Pi's hardware H.264
+# encoder — the whole point of the shim is that the transcode runs on hardware in
+# real time, so "Jellyfin asked for libx264" must still land on h264_v4l2m2m. The
+# Pi 4 has no hardware HEVC *encoder*, so libx265 is deliberately NOT redirected
+# (it falls through to passthrough / the distro build).
+_HW_H264 = "h264_v4l2m2m"
+_DEFAULT_H264_SW = ["libx264", "libopenh264", "h264"]
+
+# Video-encoder options private to libx264/libx265 (or otherwise rejected by the
+# V4L2 M2M encoder). Stripped, with their value, when we swap in the hardware
+# encoder. Matches an optional stream qualifier (:v, :v:0, :0).
+_ENC_STRIP = re.compile(
+    r"^-(?:preset|crf|qp|x264opts|x264-params|x265-params|tune|profile|level|"
+    r"sc_threshold|subq|trellis|psy-rd|aq-mode)"
+    r"(?::[a-z](?::\d+)?|:\d+)?$")
+_BV_RE = re.compile(r"^-b:v(?::\d+)?$")
+_MAXRATE_RE = re.compile(r"^-maxrate(?::v)?(?::\d+)?$")
+
+
+def parse_argv(argv):
+    """Extract the fields the shim reasons about. Returns a dict; keys are None
+    when absent. Never raises."""
+    out = {"input": None, "input_idx": None, "out_codec": None,
+           "vf_flag": None, "vf_idx": None, "vf_val": None,
+           "filter_complex": False}
+    i = 0
+    n = len(argv)
+    while i < n:
+        tok = argv[i]
+        if tok == "-i" and i + 1 < n:
+            val = argv[i + 1]
+            # first real *file* input wins (skip lavfi/pipes/devices)
+            if out["input"] is None and _looks_like_file(val):
+                out["input"] = val
+                out["input_idx"] = i
+            i += 2
+            continue
+        if _CODEC_RE.match(tok) and i + 1 < n:
+            out["out_codec"] = argv[i + 1]
+            i += 2
+            continue
+        if tok in _VF_FLAGS and i + 1 < n:
+            out["vf_flag"] = tok
+            out["vf_idx"] = i
+            out["vf_val"] = argv[i + 1]
+            i += 2
+            continue
+        if tok == "-filter_complex":
+            out["filter_complex"] = True
+        i += 1
+    return out
+
+
+def _looks_like_file(val):
+    if val.startswith("-"):
+        return False
+    if val in ("pipe:", "-") or val.startswith("pipe:"):
+        return False
+    # lavfi virtual sources / device inputs
+    for bad in ("nullsrc", "testsrc", "color=", "anullsrc", "lavfi"):
+        if bad in val:
+            return False
+    return True
+
+
+def extract_box(vf):
+    """The requested max (width, height) from the scale filter, or None.
+
+    Splits on unescaped commas so we read only the scale filter's own argument
+    (not e.g. format=yuv420p), and takes the resolution-plausible integers in
+    appearance order — Jellyfin's {maxWidth}[,{maxHeight}]. Jellyfin's scale is
+    always width-primary, in two shapes:
+      two-bound:  scale=...min(1280\\,720*a)...:...min(1280/a\\,720)...   -> (1280,720)
+      width-only: scale=...min(...\\,1280)...:trunc(ow/a/2)*2             -> (1280,None)
+    Height None means "cap width, height follows the source aspect" — fit()
+    handles it. Returns None only when no plausible width is present.
+    """
+    if not vf:
+        return None
+    parts = re.split(r"(?<!\\),", vf)
+    for p in parts:
+        s = p.strip()
+        if s.startswith("scale=") or s.startswith("scale "):
+            ints = [int(x) for x in re.findall(r"\d+", s)
+                    if _MIN_DIM <= int(x) <= _MAX_DIM]
+            if len(ints) >= 2:
+                return ints[0], ints[1]
+            if len(ints) == 1:
+                return ints[0], None   # width-only: height follows aspect
+            return None
+    return None
+
+
+def fit(src_w, src_h, max_w, max_h, wmult=64, hmult=2):
+    """Aspect-preserving fit of src into the (max_w, max_h) box, never
+    upscaling, rounded to Jellyfin's v4l2 alignment (width/64, height/2).
+    max_h may be None (width-only bound): height then follows the source aspect."""
+    if src_w <= 0 or src_h <= 0 or not max_w:
+        return None
+    ratios = [max_w / src_w, 1.0]
+    if max_h:
+        ratios.append(max_h / src_h)
+    scale = min(ratios)
+    ow = int((src_w * scale) // wmult) * wmult
+    oh = int((src_h * scale) // hmult) * hmult
+    ow = max(ow, wmult)
+    oh = max(oh, hmult)
+    return ow, oh
+
+
+def probe(ffprobe_bin, path):
+    """Return {codec,w,h,pix_fmt,bit_depth,chroma,hdr,dv} or None on any failure."""
+    try:
+        cp = subprocess.run(
+            [ffprobe_bin, "-v", "quiet", "-print_format", "json",
+             "-show_streams", "-select_streams", "v:0", path],
+            capture_output=True, timeout=15)
+        if cp.returncode != 0:
+            return None
+        data = json.loads(cp.stdout)
+        st = (data.get("streams") or [None])[0]
+        if not st:
+            return None
+        pix = st.get("pix_fmt", "") or ""
+        dv = _dv_profile(st)
+        return {
+            "codec": st.get("codec_name", "") or "",
+            "w": int(st.get("width", 0) or 0),
+            "h": int(st.get("height", 0) or 0),
+            "pix_fmt": pix,
+            "bit_depth": _bit_depth(st, pix),
+            "chroma": _chroma(pix),
+            "hdr": _is_hdr(st),
+            "dv": dv,
+            "field_order": st.get("field_order"),
+        }
+    except Exception as exc:
+        log("probe failed: %s" % exc)
+        return None
+
+
+def _dv_profile(st):
+    """Dolby Vision profile from the DOVI configuration record side data, or None.
+    Also stashes the BL signal compatibility id on the returned int is not
+    possible, so callers needing it use _is_hdr's logic."""
+    for sd in st.get("side_data_list", []) or []:
+        if sd.get("side_data_type") == "DOVI configuration record":
+            return sd.get("dv_profile")
+    return None
+
+
+def _is_hdr(st):
+    """HDR = needs a PQ/HLG->SDR tone-map. Covers HDR10/HLG via the transfer
+    characteristic AND Dolby Vision, which the transfer tag misses: single-layer
+    DV P5 carries NO standard transfer (color_transfer is null — the PQ is in the
+    RPU). Detect it via the DOVI config. BL signal compatibility id 2 means the
+    base layer is already SDR (DV P8.2) -> not HDR; every other id (0=P5 IPT-PQ,
+    1=HDR10, 4=HLG) is PQ/HLG-based -> HDR."""
+    trc = st.get("color_transfer", "") or ""
+    if trc in ("smpte2084", "arib-std-b67"):
+        return True
+    for sd in st.get("side_data_list", []) or []:
+        if sd.get("side_data_type") == "DOVI configuration record":
+            return sd.get("dv_bl_signal_compatibility_id") != 2
+    return False
+
+
+def _bit_depth(st, pix):
+    bpr = st.get("bits_per_raw_sample")
+    if bpr:
+        try:
+            return int(bpr)
+        except (TypeError, ValueError):
+            pass
+    if "10le" in pix or "10be" in pix or "p10" in pix:
+        return 10
+    if "12le" in pix or "12be" in pix or "p12" in pix:
+        return 12
+    return 8
+
+
+def _chroma(pix):
+    if "444" in pix:
+        return "444"
+    if "422" in pix:
+        return "422"
+    if "420" in pix:
+        return "420"
+    return "?"
+
+
+def build_facts(p, out_w, out_h, tm):
+    hw_decodable = (
+        p["codec"] == "hevc" and p["chroma"] == "420"
+        and p["bit_depth"] in (8, 10)
+        and 0 < p["w"] <= 4096 and 0 < p["h"] <= 4096)
+    # The bcm2835 stateful H.264 decoder (/dev/video10) handles <=1080p (coded
+    # <=1920x1920), 8-bit 4:2:0, progressive. With -no_cvt_hw it emits DRM_PRIME
+    # straight into scale_v4l2m2m (zero-copy, no SAND unpack, no tone-map). HDR is
+    # excluded (8-bit H.264 is SDR; DRM_PRIME path has no tone-map anyway).
+    fo = p.get("field_order")
+    h264_hw_decodable = (
+        p["codec"] == "h264" and p["chroma"] == "420" and p["bit_depth"] == 8
+        and 0 < p["w"] <= 1920 and 0 < p["h"] <= 1920 and not p["hdr"]
+        and fo in (None, "progressive", "unknown", ""))
+    return {
+        "src_codec": p["codec"], "src_w": p["w"], "src_h": p["h"],
+        "src_pix_fmt": p["pix_fmt"], "src_bit_depth": p["bit_depth"],
+        "src_chroma": p["chroma"], "src_hdr": p["hdr"],
+        "src_dv": p.get("dv"), "src_field_order": fo,
+        "out_w": out_w, "out_h": out_h,
+        "hw_decodable": hw_decodable,
+        "h264_hw_decodable": h264_hw_decodable, "tm": tm,
+    }
+
+
+def choose(cfg, facts, acquire):
+    """First rule whose `when` matches and (if it needs a hardware slot) whose
+    slot we can acquire. Returns (rule_name, hwaccel_args, graph) or None."""
+    # Rule conditions are Python expressions, but rule.toml authors naturally
+    # write TOML-style lowercase true/false — accept both.
+    ns = dict(facts)
+    ns.update(true=True, false=False, null=None)
+    for rule in cfg.get("rule", []):
+        cond = rule.get("when", "false")
+        try:
+            ok = bool(eval(cond, {"__builtins__": {}}, ns))  # noqa: S307
+        except Exception as exc:
+            log("rule '%s' condition error: %s" % (rule.get("name"), exc))
+            continue
+        if not ok:
+            continue
+        if rule.get("hw_slot") and not acquire():
+            log("rule '%s' matched but no hw slot free; trying next"
+                % rule.get("name"))
+            continue
+        try:
+            graph = rule["vf"].format(**facts)
+        except Exception as exc:
+            log("rule '%s' graph format error: %s" % (rule.get("name"), exc))
+            return None
+        return rule.get("name", "?"), list(rule.get("args", [])), graph
+    return None
+
+
+def build_argv(argv, p, hwaccel_args, graph, enc_target=None):
+    """Rewrite: replace the -vf value with `graph`, insert `hwaccel_args`
+    immediately before the primary -i, and (if enc_target is set) swap the video
+    encoder to the hardware one. Everything else is preserved."""
+    new = list(argv)
+    new[p["vf_idx"] + 1] = graph
+    if enc_target:
+        new = rewrite_encoder(new, enc_target)
+    if hwaccel_args:
+        # -i index can shift after the encoder rewrite (options removed), so
+        # recompute it here rather than trusting p["input_idx"].
+        try:
+            i_idx = new.index("-i")
+        except ValueError:
+            i_idx = p["input_idx"]
+        new[i_idx:i_idx] = list(hwaccel_args)
+    return new
+
+
+def rewrite_encoder(argv, target):
+    """Swap the video encoder to `target` and drop encoder-private options the
+    V4L2 M2M encoder can't accept (libx264/libx265 knobs). Rate control moves to
+    average bitrate: ensure `-b:v` is present, taking its value from an existing
+    -b:v or -maxrate. Pure list->list; never raises on well-formed argv."""
+    # Find a bitrate to carry over (prefer an explicit -b:v, else -maxrate).
+    bitrate = None
+    for i, t in enumerate(argv):
+        if _BV_RE.match(t) and i + 1 < len(argv):
+            bitrate = argv[i + 1]
+            break
+    if bitrate is None:
+        for i, t in enumerate(argv):
+            if _MAXRATE_RE.match(t) and i + 1 < len(argv):
+                bitrate = argv[i + 1]
+                break
+
+    out = []
+    i, n = 0, len(argv)
+    have_bv = False
+    while i < n:
+        t = argv[i]
+        if _CODEC_RE.match(t) and i + 1 < n:
+            out.append(t)
+            out.append(target)
+            if bitrate is not None:
+                out.append("-b:v")
+                out.append(bitrate)
+                have_bv = True
+            i += 2
+            continue
+        if _BV_RE.match(t) and i + 1 < n:
+            if not have_bv:            # keep the first -b:v, drop later dups
+                out.append(t)
+                out.append(argv[i + 1])
+                have_bv = True
+            i += 2
+            continue
+        if _ENC_STRIP.match(t) and i + 1 < n:
+            i += 2                     # drop the flag and its value
+            continue
+        out.append(t)
+        i += 1
+    return out
+
+
+def make_acquirer(cfg):
+    """flock-based slot acquisition that survives exec. Returns a callable."""
+    n = int(cfg.get("hw_slots", 1))
+    slot_dir = cfg.get("slot_dir", "/tmp/rpi-orch-slots")
+    held = []  # keep fds referenced so they aren't GC'd/closed before exec
+
+    def acquire():
+        try:
+            os.makedirs(slot_dir, exist_ok=True)
+        except Exception as exc:
+            log("slot dir unavailable (%s); denying hw slot" % exc)
+            return False
+        for i in range(n):
+            try:
+                fd = os.open(os.path.join(slot_dir, "slot%d" % i),
+                             os.O_CREAT | os.O_RDWR, 0o644)
+            except Exception:
+                continue
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except OSError:
+                os.close(fd)
+                continue
+            # Clear FD_CLOEXEC: the lock must be inherited by the exec'd ffmpeg
+            # so the kernel holds it for that process's whole life and releases
+            # it automatically on exit/kill.
+            flags = fcntl.fcntl(fd, fcntl.F_GETFD)
+            fcntl.fcntl(fd, fcntl.F_SETFD, flags & ~fcntl.FD_CLOEXEC)
+            held.append(fd)
+            return True
+        return False
+
+    return acquire
+
+
+def decide(argv, cfg, ffprobe_bin, acquire):
+    """Full decision. Returns (new_argv, decision_str) to run, or None to pass
+    the original command through unchanged. Pure except for probe + acquire,
+    both injected."""
+    hw_encoders = set(cfg.get("hw_encoders", ["h264_v4l2m2m", "hevc_v4l2m2m"]))
+    h264_sw = set(cfg.get("h264_sw_encoders", _DEFAULT_H264_SW))
+    p = parse_argv(argv)
+
+    # Cheap gate first — never probe for non-transcode invocations. Engage for a
+    # hardware encoder Jellyfin already chose (enc_target=None: keep its encoder
+    # args) OR a software H.264 encoder we redirect to the Pi's HW encoder so it
+    # runs in real time (enc_target=h264_v4l2m2m: rewrite the encoder cluster).
+    out_codec = p["out_codec"]
+    if out_codec in hw_encoders:
+        enc_target = None
+    elif out_codec in h264_sw:
+        enc_target = _HW_H264
+    else:
+        return None
+    if p["filter_complex"] or p["vf_flag"] is None:
+        return None
+    if p["input"] is None:
+        return None
+    vf = p["vf_val"] or ""
+    if "scale" not in vf or DISALLOWED.search(vf):
+        return None
+
+    # NB: deliberately *no* runtime "can the fork provide every encoder this
+    # command names?" check here. If the fork is missing one (this bit us with
+    # libmp3lame), the right outcome is the loud hard failure, not a quiet
+    # downgrade to a software transcode that merely looks slow — the fix belongs
+    # in the fork build or in these rules. install.sh diffs the fork's encoder
+    # list against the stock build at deploy time so the gap surfaces there.
+
+    box = extract_box(vf)
+    if box is None:
+        return None
+
+    pr = probe(ffprobe_bin, p["input"])
+    if pr is None or pr["w"] <= 0 or pr["h"] <= 0:
+        return None
+
+    fitted = fit(pr["w"], pr["h"], box[0], box[1])
+    if fitted is None:
+        return None
+    out_w, out_h = fitted
+    # Tone-map when the SOURCE is HDR — not when Jellyfin's -vf says "tonemap".
+    # Jellyfin frequently does NOT tone-map: with its own HDR path disabled it just
+    # relabels the output to bt709 (setparams=...:color_trc=bt709) and truncates
+    # 10->8, which washes HDR out. We're emitting 8-bit SDR H.264, so if the probe
+    # says the source is HDR, our filter must do the PQ/HLG->SDR conversion itself.
+    tm = cfg.get("tm_hdr", "accurate") if pr["hdr"] else "none"
+    facts = build_facts(pr, out_w, out_h, tm)
+
+    chosen = choose(cfg, facts, acquire)
+    if chosen is None:
+        return None
+    name, hwaccel_args, graph = chosen
+    new_argv = build_argv(argv, p, hwaccel_args, graph, enc_target)
+    enc_note = (" enc=%s->%s" % (out_codec, enc_target)) if enc_target else ""
+    dv_note = (" dv=P%s" % pr["dv"]) if pr.get("dv") else ""
+    decision = ("rule=%r src=%s %dx%d %db %s hdr=%s%s -> out=%dx%d%s vf=%r"
+                % (name, pr["codec"], pr["w"], pr["h"], pr["bit_depth"],
+                   pr["chroma"], pr["hdr"], dv_note, out_w, out_h, enc_note, graph))
+    return new_argv, decision
+
+
+def main():
+    argv = sys.argv[1:]
+    cfg = load_config()
+    # Two distinct real binaries, because the shim AUGMENTS rather than replaces:
+    #  - passthrough_ffmpeg: for every command we do NOT rewrite. Must be the
+    #    full-featured build Jellyfin expects (the distro jellyfin-ffmpeg has
+    #    libx264/libx265 and other GPL bits our fork build omits). Using the fork
+    #    here breaks libx264 software transcodes ("Option not found" on -x264opts).
+    #  - hw_ffmpeg: only for our rewritten hardware graph, which needs the fork's
+    #    sand_to_yuv420p_drm / scale_v4l2m2m filters and h264_v4l2m2m.
+    passthrough_ffmpeg = real_binary(cfg, "ffmpeg", "ffmpeg")
+    if not cfg or not cfg.get("rule"):
+        exec_real(passthrough_ffmpeg, argv)   # no rules -> passthrough
+        return
+    ffprobe_bin = real_binary(cfg, "ffprobe", "ffprobe")
+    try:
+        result = decide(argv, cfg, ffprobe_bin, make_acquirer(cfg))
+    except Exception as exc:
+        log("decide() crashed, passing through: %s" % exc)
+        result = None
+    if result is None:
+        exec_real(passthrough_ffmpeg, argv)
+        return
+    new_argv, decision = result
+    hw_ffmpeg = real_binary(cfg, "hw_ffmpeg", "ffmpeg")
+    log("engaged: %s" % decision)
+    exec_real(hw_ffmpeg, new_argv)
+
+
+if __name__ == "__main__":
+    main()
