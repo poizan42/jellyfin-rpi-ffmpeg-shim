@@ -41,16 +41,29 @@ STOCK="${2:-/usr/lib/jellyfin-ffmpeg/ffmpeg}"
 #   sonic / sonicls        : experimental encoders, never selected
 EXPECTED_MISSING='_(nvenc|cuvid|rkmpp|rkrga|qsv|vaapi|amf|cuda|opencl)$|^(cuda|opencl|rkmpp)$|^libfdk_aac$|^libsvtav1$|^libtheora$|^sonic(ls)?$'
 
-# Capability kinds to compare. Filters are listed with a 3-char flag column, the
-# codec-ish kinds with a 6-char one.
+# Capability kinds to compare. The listing formats differ per kind AND across
+# FFmpeg versions (8.x dropped the filter "command support" flag, so that column
+# is 2 chars there and 3 in 7.x) — hence a parser per kind rather than one
+# regex, and a hard error if one yields nothing.
 KINDS="decoders encoders filters muxers demuxers bsfs protocols"
 
 cap_list() {  # $1 = binary, $2 = kind
   case "$2" in
-    filters)   "$1" -hide_banner -filters   2>/dev/null | sed -nE 's/^ [A-Z.]{3} +([^ ]+).*/\1/p' ;;
-    protocols) "$1" -hide_banner -protocols 2>/dev/null | sed -nE 's/^[[:space:]]+([A-Za-z][A-Za-z0-9_+.-]*)$/\1/p' ;;
-    bsfs)      "$1" -hide_banner -bsfs      2>/dev/null | sed -nE 's/^[[:space:]]+([A-Za-z][A-Za-z0-9_.-]*)$/\1/p' ;;
-    *)         "$1" -hide_banner -"$2"      2>/dev/null | sed -nE 's/^ [A-Z.]{6} ([^ ]+).*/\1/p' ;;
+    # " TSC name  A->A  desc" (7.x) / " TS name  A->A  desc" (8.x)
+    filters)         "$1" -hide_banner -filters 2>/dev/null |
+                       sed -nE 's/^ [A-Z.]{2,3} +([A-Za-z0-9_]+) +[AVN|]+->.*/\1/p' ;;
+    # bare names, one per line, after a "Bitstream filters:" header
+    bsfs)            "$1" -hide_banner -bsfs 2>/dev/null |
+                       sed -nE 's/^([a-z][a-z0-9_]*)$/\1/p' ;;
+    # indented bare names under "Input:"/"Output:" headers
+    protocols)       "$1" -hide_banner -protocols 2>/dev/null |
+                       sed -nE 's/^[[:space:]]+([A-Za-z][A-Za-z0-9_+.-]*)$/\1/p' ;;
+    # "  E  name   long name"  (flags are D/E/d in a 3-wide field)
+    muxers|demuxers) "$1" -hide_banner -"$2" 2>/dev/null |
+                       sed -nE 's/^ [DEd. ]{3} ([A-Za-z0-9][A-Za-z0-9_,+-]*) .*/\1/p' ;;
+    # " V....D name  long name" — 6 flag chars
+    *)               "$1" -hide_banner -"$2" 2>/dev/null |
+                       sed -nE 's/^ [A-Z.]{6} ([^ ]+).*/\1/p' ;;
   esac | sort -u
 }
 
