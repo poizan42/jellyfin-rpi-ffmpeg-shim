@@ -34,10 +34,19 @@ Three facts, established by measurement on a Pi 4, make a decision layer
   — the SAND unpack, tone-map tiers and ISP bridge this shim's rules depend on)
   is not wired in by default. The shim is the reversible one-line hook that puts
   it there.
-- **Jellyfin builds a pure-software graph for "v4l2m2m" mode** (software decode +
-  software scale/tonemap + `h264_v4l2m2m` encode). Swapping the binary alone would
-  *not* exercise the hardware pipeline — something has to rewrite the command. The
-  shim does exactly that, matching only what it positively recognises.
+- **The graph Jellyfin builds doesn't use the Pi's pipeline.** What it emits
+  depends on how you configure it, so take this as the tested case rather than a
+  general claim: with *Hardware acceleration* = **V4L2**, hardware decoding enabled
+  for H264, and **hardware encoding off**, Jellyfin builds a software decode +
+  software `scale`/`tonemap` chain feeding `libx264`. Even with hardware encoding
+  on (`h264_v4l2m2m`), the *filter* chain is still software `scale`/`tonemapx`:
+  Jellyfin's filter-chain builder has no V4L2 arm, only QSV/VAAPI/NVENC/RKMPP
+  ones — and the filters are where nearly all the CPU goes. Either way, swapping
+  the binary alone
+  would not exercise the hardware pipeline; something has to rewrite the command.
+  The shim does that, matching only what it positively recognises and passing
+  through anything else — including graph shapes from other configurations
+  (`hwupload`/`hwmap`/`overlay`/deinterlace are all on the passthrough list).
 
 ## Layout
 
@@ -220,6 +229,15 @@ JELLYFIN_FFMPEG_OPT="--ffmpeg=/opt/rpi-ffmpeg-orchestrator/bin/ffmpeg"
 
 then `sudo systemctl restart jellyfin`. To revert, restore the original line and
 restart. No server rebuild either way.
+
+**Jellyfin settings this was tested with** (Dashboard → Playback → Transcoding):
+*Hardware acceleration* = **Video4Linux2 (V4L2)**, *hardware decoding* enabled for
+**H264**, *hardware encoding* **off** (so Jellyfin asks for `libx264` and the shim
+redirects it to `h264_v4l2m2m`). Turning hardware encoding on also works — the
+shim then keeps Jellyfin's `h264_v4l2m2m` and only rewrites the graph. Other
+combinations aren't tested; the shim's response to an unrecognised command shape
+is to pass it through, so the failure mode is "no speed-up", not "broken
+playback".
 
 *Alternatives, if you'd rather keep the checkout as the single live source (no
 copy to refresh):* open traversal on the home directory holding it — either
