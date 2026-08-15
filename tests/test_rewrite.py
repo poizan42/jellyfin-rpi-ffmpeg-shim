@@ -298,8 +298,9 @@ class TestUnknownEncoderIsNotAbsorbed(unittest.TestCase):
     """The shim must not quietly swallow a fork build defect. If the fork can't
     provide an encoder the command names (this bit us with libmp3lame), the
     transcode should fail loudly so the fork/rules get fixed — the shim has no
-    encoder-availability check, and must not grow one. Deploy-time detection
-    lives in check-encoders.sh, which install.sh runs and refuses to deploy on."""
+    capability check, and must not grow one. Deploy-time detection
+    lives in check-capabilities.sh, which install.sh runs and refuses to deploy
+    on."""
 
     def test_audio_encoder_is_passed_through_untouched(self):
         argv = jf_x264_cmd()

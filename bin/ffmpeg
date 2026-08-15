@@ -43,7 +43,8 @@ _MIN_DIM, _MAX_DIM = 120, 8192
 # encoder — the whole point of the shim is that the transcode runs on hardware in
 # real time, so "Jellyfin asked for libx264" must still land on h264_v4l2m2m. The
 # Pi 4 has no hardware HEVC *encoder*, so libx265 is deliberately NOT redirected
-# (it falls through to passthrough / the distro build).
+# (it passes through untouched — still a software HEVC encode, but it runs on the
+# fork, so at least the *decode* side gets the optimised HEVC path).
 _HW_H264 = "h264_v4l2m2m"
 _DEFAULT_H264_SW = ["libx264", "libopenh264", "h264"]
 
@@ -454,14 +455,18 @@ def decide(argv, cfg, ffprobe_bin, acquire):
 def main():
     argv = sys.argv[1:]
     cfg = load_config()
-    # Two distinct real binaries, because the shim AUGMENTS rather than replaces:
-    #  - passthrough_ffmpeg: for every command we do NOT rewrite. Must be the
-    #    full-featured build Jellyfin expects (the distro jellyfin-ffmpeg has
-    #    libx264/libx265 and other GPL bits our fork build omits). Using the fork
-    #    here breaks libx264 software transcodes ("Option not found" on -x264opts).
-    #  - hw_ffmpeg: only for our rewritten hardware graph, which needs the fork's
-    #    sand_to_yuv420p_drm / scale_v4l2m2m filters and h264_v4l2m2m.
-    passthrough_ffmpeg = real_binary(cfg, "ffmpeg", "ffmpeg")
+    # One real binary for everything: the fork. It is a superset of the stock
+    # build (check-capabilities.sh enforces that at deploy time), and it carries
+    # optimisations that matter precisely on the commands we do NOT rewrite --
+    # the faster HEVC software decode above all. Passing those through to the
+    # stock build would throw that away.
+    #
+    # `passthrough_ffmpeg` is an optional escape hatch for a deployment whose
+    # fork build is NOT a superset (e.g. a lean build kept for iteration): set it
+    # and unrewritten commands go there instead. Defaults to the same binary.
+    ffmpeg_bin = real_binary(cfg, "ffmpeg", "ffmpeg")
+    passthrough_ffmpeg = (real_binary(cfg, "passthrough_ffmpeg", "ffmpeg")
+                          if (cfg or {}).get("passthrough_ffmpeg") else ffmpeg_bin)
     if not cfg or not cfg.get("rule"):
         exec_real(passthrough_ffmpeg, argv)   # no rules -> passthrough
         return
@@ -475,9 +480,8 @@ def main():
         exec_real(passthrough_ffmpeg, argv)
         return
     new_argv, decision = result
-    hw_ffmpeg = real_binary(cfg, "hw_ffmpeg", "ffmpeg")
     log("engaged: %s" % decision)
-    exec_real(hw_ffmpeg, new_argv)
+    exec_real(ffmpeg_bin, new_argv)
 
 
 if __name__ == "__main__":

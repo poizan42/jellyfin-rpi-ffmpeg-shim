@@ -19,24 +19,30 @@
 # NOTE: `when` is eval()'d. This is a local, trusted, root-owned config; if that
 # ever stops being true, replace the evaluator before shipping.
 
-# The shim AUGMENTS the stock build; it does not replace it. Two real binaries:
+# ONE real binary: the fork build
+# (https://github.com/poizan42/jellyfin-rpi-ffmpeg). It runs both the rewritten
+# hardware graph -- which needs its sand_to_yuv420p_drm / scale_v4l2m2m filters
+# and h264_v4l2m2m -- and every command the shim does NOT rewrite.
 #
-#  hw_ffmpeg  — our fork build (has sand_to_yuv420p_drm, scale_v4l2m2m, the SAND
-#               and tonemap work). Used ONLY for the rewritten hardware graph.
-#  ffmpeg     — the full-featured build Jellyfin expects, for EVERY command the
-#               shim does not rewrite (probes, thumbnails, formats we can't do on
-#               hardware). Must have the GPL bits the fork omits (libx264 etc.);
-#               the fork errors on `-x264opts` with "Option not found". The stock
-#               jellyfin-ffmpeg is the right target. Its ffprobe is used for the
-#               shim's own source probe too.
+# Passthrough deliberately goes to the fork too, not to the stock
+# jellyfin-ffmpeg: the fork also carries software-decode optimisations (notably
+# the NEON/CABAC HEVC work), and those pay off precisely on the commands we
+# cannot route onto the hardware. Handing those to the stock build would throw
+# the optimisations away. The fork is built full-featured so it is a superset of
+# the stock build; check-capabilities.sh enforces that at deploy time.
 #
-# install.sh rewrites hw_ffmpeg to the copy it places in the install prefix. In
-# a source tree the shim also falls back to a sibling checkout of the fork
-# (../ffmpeg-jellyfin/ffmpeg) and then to PATH, so this path not existing is not
-# fatal — see real_binary() in bin/_orch.py.
-hw_ffmpeg = "/opt/rpi-ffmpeg-orchestrator/ffmpeg-real"
-ffmpeg    = "/usr/lib/jellyfin-ffmpeg/ffmpeg"
-ffprobe   = "/usr/lib/jellyfin-ffmpeg/ffprobe"
+# install.sh rewrites these to the copies it places in the install prefix. In a
+# source tree the shim also falls back to a sibling checkout of the fork
+# (../ffmpeg-jellyfin/) and then to PATH, so these paths not existing is not
+# fatal -- see real_binary() in bin/_orch.py.
+ffmpeg  = "/opt/rpi-ffmpeg-orchestrator/ffmpeg-real"
+ffprobe = "/opt/rpi-ffmpeg-orchestrator/ffprobe-real"
+
+# Optional escape hatch: if your fork build is NOT a superset of the stock build
+# (e.g. a lean build kept for fast iteration), point this at the stock binary and
+# unrewritten commands go there instead -- at the cost of the fork's
+# software-decode optimisations on that path. Unset = use `ffmpeg` for everything.
+# passthrough_ffmpeg = "/usr/lib/jellyfin-ffmpeg/ffmpeg"
 
 # Encoders that mean "this is a Pi hardware-encode transcode we can optimise".
 hw_encoders = ["h264_v4l2m2m", "hevc_v4l2m2m"]

@@ -57,8 +57,9 @@ bin/ffprobe    passthrough sibling (Jellyfin derives the ffprobe path from the
 bin/_orch.py   shared helpers: config load, real-binary resolution, exec, logging
 rules.toml     the policy: real-binary paths, hw_encoders, hw_slots, the rules
 install.sh     copy shim + rules + fork binary to a Jellyfin-reachable prefix
-check-encoders.sh  deploy-time check that the fork is an encoder superset of the
-               stock build (install.sh refuses to deploy on an unexplained gap)
+check-capabilities.sh  deploy-time check that the fork is a superset of the stock
+               build — decoders/encoders/filters/muxers/demuxers/bsfs/protocols
+               (install.sh refuses to deploy on an unexplained gap)
 tests/         test_rewrite.py (pure golden-rewrite unit tests, no hardware)
                live.sh        (end-to-end + concurrency + fail-safe, needs the Pi)
 ```
@@ -90,34 +91,48 @@ tests/         test_rewrite.py (pure golden-rewrite unit tests, no hardware)
    control, not CRF). Everything else is preserved.
 6. **exec** the real ffmpeg. On *any* exception anywhere above → passthrough.
 
-### Augments the stock build, does not replace it
-Two real binaries, by role: **`hw_ffmpeg`** (our fork — has the SAND/ISP filters
-and `h264_v4l2m2m`) is used *only* for the rewritten hardware graph; **`ffmpeg`**
-(the stock `jellyfin-ffmpeg`) runs everything the shim does *not* rewrite.
-Passthrough goes to the build Jellyfin was designed for, so an unrecognised
-command line behaves exactly as it did before the shim existed.
+### One binary: the fork, for everything
+The shim execs **the fork** both for the rewritten hardware graph (which needs its
+`sand_to_yuv420p_drm` / `scale_v4l2m2m` filters and `h264_v4l2m2m`) *and* for every
+command it passes through untouched.
+
+Passthrough deliberately does **not** go to the stock `jellyfin-ffmpeg`. The fork
+is not only about the hardware path — it also carries **software-decode
+optimisations** (the NEON/CABAC HEVC work, ~1.3× on 10-bit software decode), and
+those pay off precisely on the commands the shim *can't* route onto the hardware:
+the formats rpivid won't take, the `libx265` transcodes, the interlaced sources.
+Sending those to the stock build would throw the optimisations away exactly where
+they are most needed.
+
+The price is that the fork must be a **superset** of the stock build — see the
+next section. If yours isn't, `passthrough_ffmpeg` in `rules.toml` sends
+unrewritten commands to the stock binary instead; that is an explicit, documented
+choice, not the default.
 
 ### The fork must be a superset — checked at deploy time, not at runtime
-The shim rewrites only the **video** side of the graph; `-codec:a` and friends are
-passed through verbatim into the fork's command line. So the fork has to be able
-to run any encoder Jellyfin might name. It wasn't, once: `-codec:a:0 libmp3lame`
-against the then-lean fork build died with `Encoder not found` → "Source error"
-in the client.
+Jellyfin builds every command line for the stock build, and the shim hands the
+fork *all* of them (rewriting only the video side of the ones it recognises — the
+audio cluster and everything else goes through verbatim). So anything the stock
+build can do and the fork can't is a live failure waiting to happen. It happened
+once: `-codec:a:0 libmp3lame` against the then-lean fork died with
+`Encoder not found` → "Source error" in the client.
 
-**[`check-encoders.sh`](check-encoders.sh)** diffs the fork's encoder list against
-the stock build's, minus a short justified `EXPECTED_MISSING` list (other vendors'
-hardware, nonfree, dead formats). `install.sh` runs it and **refuses to deploy** on
-an unexplained gap (`SKIP_ENCODER_CHECK=1` overrides). Run it any time:
+**[`check-capabilities.sh`](check-capabilities.sh)** diffs the fork against the
+stock build across **decoders, encoders, filters, muxers, demuxers, bitstream
+filters and protocols**, minus a short justified `EXPECTED_MISSING` list (other
+vendors' hardware, nonfree, dead formats). `install.sh` runs it and **refuses to
+deploy** on an unexplained gap (`SKIP_CAPABILITY_CHECK=1` overrides). Run it any
+time:
 
 ```bash
-./check-encoders.sh
+./check-capabilities.sh
 ```
 
-**The shim deliberately has no runtime encoder-availability check.** Detecting the
-gap at transcode time and passing through would convert a build defect into a
-quiet performance regression — playback keeps working, in software, and nobody
-notices the fork is broken until the box can't keep up. The failure should stay
-loud and land where it can be fixed: in the fork build, or in these rules.
+**The shim deliberately has no runtime capability check.** Detecting a gap at
+transcode time and routing around it would convert a build defect into a quiet
+regression — playback keeps working, slower, and nobody notices the fork is broken
+until the box can't keep up. The failure should stay loud and land where it can be
+fixed: in the fork build, or in these rules.
 
 ### Admission control (`flock`, survives exec)
 
@@ -210,14 +225,12 @@ sudo ./install.sh /usr/local/lib/orch   # ...or any prefix you prefer
 It expects the fork build in a sibling checkout (`../ffmpeg-jellyfin`); set
 `FORK_DIR=/path/to/jellyfin-rpi-ffmpeg` if it lives elsewhere.
 
-`install.sh` copies the shim and the fork **`ffmpeg`** (a static libav build, so it
-is self-contained — only system `.so` deps) to `/opt/rpi-ffmpeg-orchestrator/`,
-makes them world-traversable, and writes an installed `rules.toml` whose
-`hw_ffmpeg` points at the copy. Passthrough + probe use the stock
-`jellyfin-ffmpeg` in place (the service can already reach `/usr/lib`), so nothing
-else is copied. A symlink to the fork would *not* work — its target stays behind
-the same permission wall — so the fork binary is copied; **re-run `install.sh`
-after rebuilding the fork** to refresh it.
+`install.sh` copies the shim and the fork's **`ffmpeg` and `ffprobe`** (a static
+libav build, so they are self-contained — only system `.so` deps) to
+`/opt/rpi-ffmpeg-orchestrator/`, makes them world-traversable, and writes an
+installed `rules.toml` pointing at the copies. A symlink to the fork would *not*
+work — its target stays behind the same permission wall — so the binaries are
+copied; **re-run `install.sh` after rebuilding the fork** to refresh them.
 
 Then edit `/etc/default/jellyfin` and point `JELLYFIN_FFMPEG_OPT` at the installed
 shim:
@@ -309,8 +322,10 @@ a one-line reversible hook instead of a server rebuild.
 - A build of [poizan42/jellyfin-rpi-ffmpeg](https://github.com/poizan42/jellyfin-rpi-ffmpeg)
   (branch `jellyfin-rpi`) — it provides `sand_to_yuv420p_drm`, `scale_v4l2m2m` and
   the tone-map tiers the rules reference. Build it **full-featured** (see that
-  repo's README → "Building"); `check-encoders.sh` enforces it.
-- The stock `jellyfin-ffmpeg` package, kept in place for passthrough.
+  repo's README → "Building"); `check-capabilities.sh` enforces it.
+- The stock `jellyfin-ffmpeg` package. The shim doesn't run it — it is the
+  reference the capability check diffs against, and what you fall back to by
+  restoring one line in `/etc/default/jellyfin`.
 - Python 3.11+ (`tomllib`); no third-party modules.
 - Enough CMA for what you want to run in hardware. 4K HEVC decode needs a big
   contiguous pool; the numbers here were measured at `cma=512M` on a Pi 4, but the
