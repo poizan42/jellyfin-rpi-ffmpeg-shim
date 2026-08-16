@@ -156,7 +156,14 @@ def probe(ffprobe_bin, path):
         cp = subprocess.run(
             [ffprobe_bin, "-v", "quiet", "-print_format", "json",
              "-show_streams", "-select_streams", "v:0", path],
-            capture_output=True, timeout=15)
+            # Generous on purpose. This probe costs well under a second on an
+            # idle box (0.2s for a 3.5 GB 4K DV file), but a probe failure means
+            # passthrough — no hardware at all — and that is self-reinforcing:
+            # one software transcode saturates the four cores, which starves the
+            # NEXT probe past the timeout, which makes that session software too.
+            # Seen in production at timeout=15. If a probe really takes a minute,
+            # something is wrong enough that passthrough is the right answer.
+            capture_output=True, timeout=60)
         if cp.returncode != 0:
             return None
         data = json.loads(cp.stdout)
@@ -359,15 +366,36 @@ def make_acquirer(cfg):
     def acquire():
         try:
             os.makedirs(slot_dir, exist_ok=True)
+            # Sticky + world-writable, like /tmp itself: the shim runs as
+            # whoever invoked it — the jellyfin service user in production, your
+            # own user when testing by hand — and they must share these slots.
+            # Without this the first user to run creates root-owned-by-them
+            # slot files and everyone else silently fails to acquire.
+            os.chmod(slot_dir, 0o1777)
+        except FileExistsError:
+            pass
+        except PermissionError:
+            pass          # someone else made it; only the mode may be wrong
         except Exception as exc:
             log("slot dir unavailable (%s); denying hw slot" % exc)
             return False
         for i in range(n):
+            path = os.path.join(slot_dir, "slot%d" % i)
             try:
-                fd = os.open(os.path.join(slot_dir, "slot%d" % i),
-                             os.O_CREAT | os.O_RDWR, 0o644)
-            except Exception:
+                fd = os.open(path, os.O_CREAT | os.O_RDWR, 0o666)
+            except Exception as exc:
+                # NOT contention — the slot is unusable to us. Say so, or this
+                # is indistinguishable from a busy slot and hardware silently
+                # stops being used. (Seen in production: slot files owned by
+                # another user, mode 0644, from a hand-run of the shim.)
+                log("slot %s unusable (%s) — treating as taken; fix its "
+                    "ownership/permissions to restore hardware admission"
+                    % (path, exc))
                 continue
+            try:
+                os.fchmod(fd, 0o666)   # so the next user can take it too
+            except Exception:
+                pass
             try:
                 fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
             except OSError:
