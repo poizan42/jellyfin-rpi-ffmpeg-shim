@@ -8,6 +8,7 @@ Run: python3 tests/test_rewrite.py   (from the transcode-orchestrator dir)
 import os
 import sys
 import unittest
+from fractions import Fraction
 from importlib.machinery import SourceFileLoader
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -67,14 +68,15 @@ def jf_x264_cmd(max_w=1280, inp="/movies/x.mkv"):
             "-f", "hls", "-y", "/cache/out.m3u8"]
 
 
-def run(argv, probe_ret, slot=True):
-    """Invoke decide() with probe + acquire stubbed."""
-    orig = shim.probe
+def run(argv, probe_ret, slot=True, kept=1.0, cfg=None):
+    """Invoke decide() with probe, the noref measurement and acquire stubbed."""
+    orig = shim.probe, shim.noref_kept
     shim.probe = lambda *_a, **_k: probe_ret
+    shim.noref_kept = lambda *_a, **_k: kept
     try:
-        return shim.decide(argv, CFG, "ffprobe", lambda: slot)
+        return shim.decide(argv, cfg or CFG, "ffprobe", lambda: slot)
     finally:
-        shim.probe = orig
+        shim.probe, shim.noref_kept = orig
 
 
 class TestGate(unittest.TestCase):
@@ -459,6 +461,130 @@ class TestEveryPassthroughSaysWhy(unittest.TestCase):
             with Logged() as lg:
                 self.assertIsNone(run(argv, stub_probe()))
             self.assertEqual(lg.lines, [], argv)
+
+
+class TestNorefMeasurement(unittest.TestCase):
+    """noref_kept() = packets surviving the noref filter_units / all packets."""
+
+    def test_ratio_of_surviving_packets(self):
+        def fake(cmd, **_k):
+            n = 41 if any("filter_units" in c for c in cmd) else 121
+            out = "#tb 0: 1/90000\n" + "0, 1, 1, 1, 9, 0x0\n" * n
+            return type("CP", (), {"returncode": 0, "stdout": out, "stderr": ""})()
+        orig = shim.subprocess.run
+        shim.subprocess.run = fake
+        try:
+            self.assertAlmostEqual(shim.noref_kept("ffmpeg", "/x.mkv"), 41 / 121)
+        finally:
+            shim.subprocess.run = orig
+
+    def test_failure_is_none_and_logged(self):
+        def fake(cmd, **_k):
+            return type("CP", (), {"returncode": 1, "stdout": "", "stderr": "boom"})()
+        orig = shim.subprocess.run
+        shim.subprocess.run = fake
+        try:
+            with Logged() as lg:
+                self.assertIsNone(shim.noref_kept("ffmpeg", "/x.mkv"))
+        finally:
+            shim.subprocess.run = orig
+        self.assertTrue(any("noref measurement failed" in l for l in lg.lines))
+
+
+class TestHighFrameRate(unittest.TestCase):
+    """4K above 30 fps is decode+unpack bound (0.54-0.59x measured), so the
+    hardware-decode path halves it: skip non-reference frames, regularise with
+    fps= before the unpack. 1080p50/60 is NOT halved (the fork's encoder raises
+    its H.264 level for it and it runs in real time)."""
+
+    def _run(self, argv=None, kept=1.0, **probe):
+        argv = argv or jf_cmd(jf_vf(1920, 1080), codec="libx264")
+        with Logged() as lg:
+            res = run(argv, stub_probe(**probe), kept=kept)
+        self.assertIsNotNone(res)
+        new, decision = res
+        return new, new[new.index("-vf") + 1], decision, lg.lines
+
+    def test_4k60_halved_with_noref_skip(self):
+        new, vf, decision, _ = self._run(fps=Fraction(60))
+        self.assertTrue(vf.startswith("fps=30,sand_to_yuv420p_drm="), vf)
+        i = new.index("-i")
+        self.assertEqual(new[i - 6:i], ["-skip_frame", "noref", "-hwaccel", "drm",
+                                        "-hwaccel_output_format", "drm_prime"])
+        self.assertIn("hfr=60->30 fps", decision)
+
+    def test_4k_5994_keeps_the_ntsc_rational(self):
+        _, vf, decision, _ = self._run(fps=Fraction(60000, 1001))
+        self.assertTrue(vf.startswith("fps=30000/1001,"), vf)
+        self.assertIn("hfr=59.94->29.97 fps", decision)
+
+    def test_4k50_to_25(self):
+        _, vf, _, _ = self._run(fps=Fraction(50))
+        self.assertTrue(vf.startswith("fps=25,"), vf)
+
+    def test_4k120_halved_until_it_fits(self):
+        _, vf, _, _ = self._run(fps=Fraction(120))
+        self.assertTrue(vf.startswith("fps=30,"), vf)
+
+    def test_4k24_and_4k30_untouched(self):
+        for fps in (Fraction(24000, 1001), Fraction(30)):
+            new, vf, decision, _ = self._run(fps=fps)
+            self.assertNotIn("fps=", vf)
+            self.assertNotIn("-skip_frame", new)
+            self.assertNotIn("hfr=", decision)
+
+    def test_1080p60_untouched(self):
+        new, vf, decision, _ = self._run(fps=Fraction(60), w=1920, h=1080)
+        self.assertNotIn("fps=", vf)
+        self.assertNotIn("-skip_frame", new)
+
+    def test_client_cap_below_target_wins(self):
+        argv = jf_cmd(jf_vf(1920, 1080), codec="libx264")
+        argv[argv.index("-y"):argv.index("-y")] = ["-r", "24"]
+        new, vf, _, _ = self._run(argv, fps=Fraction(60))
+        self.assertTrue(vf.startswith("fps=24,"), vf)
+        self.assertEqual(new[new.index("-r") + 1], "24")
+
+    def test_client_rate_above_target_is_lowered(self):
+        argv = jf_cmd(jf_vf(1920, 1080), codec="libx264")
+        argv[argv.index("-y"):argv.index("-y")] = ["-r", "60"]
+        new, vf, _, _ = self._run(argv, fps=Fraction(60))
+        self.assertEqual(new[new.index("-r") + 1], "30")   # else frames re-duplicated
+
+    def test_too_few_survivors_halves_without_noref(self):
+        # 33% kept -> noref would leave 20 fps, below the 30 target: fps= would
+        # pad with repeats. Halve evenly with fps= alone, and say it's slow.
+        new, vf, decision, _ = self._run(fps=Fraction(60), kept=130 / 390)
+        self.assertTrue(vf.startswith("fps=30,"), vf)
+        self.assertNotIn("-skip_frame", new)
+        self.assertIn("noref would keep only 20 fps", decision)
+        self.assertIn("likely below real time", decision)
+
+    def test_just_enough_survivors_uses_noref(self):
+        new, _, decision, _ = self._run(fps=Fraction(60), kept=0.54)   # 32.4 fps
+        self.assertIn("-skip_frame", new)
+        self.assertIn("noref keeps 54%", decision)
+
+    def test_unmeasurable_share_halves_without_noref(self):
+        new, vf, decision, _ = self._run(fps=Fraction(60), kept=None)
+        self.assertTrue(vf.startswith("fps=30,"), vf)
+        self.assertNotIn("-skip_frame", new)
+        self.assertIn("share unknown", decision)
+
+    def test_disabled_keeps_rate_but_says_so(self):
+        cfg = dict(CFG, hfr_max_fps=0)
+        with Logged() as lg:
+            new, _ = run(jf_cmd(jf_vf(1920, 1080), codec="libx264"),
+                         stub_probe(fps=Fraction(60)), cfg=cfg)
+        self.assertNotIn("fps=", new[new.index("-vf") + 1])
+        self.assertTrue(any("full rate" in l for l in lg.lines), lg.lines)
+
+    def test_software_fallback_is_not_halved(self):
+        # no hw slot -> software-decode rule: no -hwaccel, so no -skip_frame
+        with Logged():
+            new, _ = run(jf_cmd(jf_vf(1920, 1080), codec="libx264"),
+                         stub_probe(fps=Fraction(60)), slot=False)
+        self.assertNotIn("-skip_frame", new)
 
 
 if __name__ == "__main__":

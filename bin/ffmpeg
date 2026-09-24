@@ -18,11 +18,18 @@ import os
 import re
 import sys
 import json
+from fractions import Fraction
 import fcntl
 import subprocess
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from _orch import load_config, real_binary, exec_real, log  # noqa: E402
+
+# -skip_frame noref drops the HEVC sub-layer non-reference pictures: NAL types
+# TRAIL_N, TSA_N, STSA_N, RADL_N, RASL_N, RSV_VCL_N10/12/14. Removing those AND
+# every non-VCL unit (32-63: parameter sets, AUD, SEI, ...) empties exactly the
+# packets whose picture noref would skip, and filter_units drops empty packets.
+_NOREF_BSF = "filter_units=remove_types=0|2|4|6|8|10|12|14|32-63"
 
 # What Jellyfin's filter graph contains decides how much of the command we can
 # take over. Three outcomes, and every one of them is logged:
@@ -207,10 +214,104 @@ def probe(ffprobe_bin, path):
             "hdr": _is_hdr(st),
             "dv": dv,
             "field_order": st.get("field_order"),
+            "fps": _rate(st.get("avg_frame_rate")) or _rate(st.get("r_frame_rate")),
         }
     except Exception as exc:
         log("probe failed: %s" % exc)
         return None
+
+
+def _rate(r):
+    """An ffprobe rate ("60000/1001") as a Fraction, or None if absent/zero."""
+    try:
+        f = Fraction(r)
+        return f if f > 0 else None
+    except (TypeError, ValueError, ZeroDivisionError):
+        return None
+
+
+def noref_kept(ffmpeg_bin, path, seconds=2):
+    """Fraction of pictures -skip_frame noref would KEEP, measured on the first
+    `seconds` of the stream by stream copy -- no decode, ~0.2-0.4 s on 4K60.
+    None if it can't be measured.
+
+    It varies wildly with how the stream was encoded: 33%..100% on five real
+    4K60 files (matching a real noref decode to within a point). Below half,
+    halving via noref would leave fps= to fill gaps with repeated frames --
+    fewer unique frames than the log claims, unevenly spaced."""
+    def packets(bsf):
+        cmd = [ffmpeg_bin, "-nostdin", "-v", "error", "-t", str(seconds), "-i", path,
+               "-map", "0:v:0", "-c:v", "copy"]
+        cmd += (["-bsf:v", bsf] if bsf else []) + ["-f", "framecrc", "-"]
+        cp = subprocess.run(cmd, capture_output=True, text=True, errors="replace",
+                            timeout=30)
+        if cp.returncode != 0:
+            raise RuntimeError(cp.stderr.strip().splitlines()[-1:] or "exit %d"
+                               % cp.returncode)
+        return sum(1 for l in cp.stdout.splitlines() if l and not l.startswith("#"))
+    try:
+        total = packets(None)
+        return packets(_NOREF_BSF) / total if total else None
+    except Exception as exc:
+        log("noref measurement failed: %s" % exc)
+        return None
+
+
+def _output_rate(argv, input_idx):
+    """(index, Fraction) of an output-side `-r` Jellyfin set (only when a client
+    caps the frame rate), or (None, None)."""
+    for i in range(input_idx + 2 if input_idx is not None else 0, len(argv) - 1):
+        if argv[i] in ("-r", "-r:v", "-r:v:0"):
+            return i, _rate(argv[i + 1])
+    return None, None
+
+
+def hfr_plan(cfg, pr, argv, input_idx, measure_kept):
+    """How to handle a high-frame-rate 4K source on the hardware-decode path.
+
+    Returns (target_rate or None, use_noref, note). None = leave the rate alone.
+    `measure_kept()` gives the share of frames -skip_frame noref would keep.
+
+    Decoding AND unpacking 4K at 50/60 fps is more than the Pi 4 sustains, at
+    any output size: measured 0.54-0.59x on four real 4K60 sources, bound on
+    the shared memory bus, not on the encoder. Halving the rate -- skipping
+    non-reference frames at decode, then regularising before the unpack --
+    measured 0.86-1.14x -- but only where noref keeps at least the target rate;
+    otherwise fps= alone (even cadence, 0.57-0.90x). 1080p50/60 is NOT halved: the fork raises the encoder's
+    H.264 level for it and it runs 1.02-1.38x at full rate."""
+    max_fps = cfg.get("hfr_max_fps", 30)
+    fps = pr.get("fps")
+    if fps is None or pr["w"] * pr["h"] <= cfg.get("hfr_min_pixels", 1920 * 1088):
+        return None, False, ""
+    if not max_fps:
+        if fps > 30:
+            log("hfr: %dx%d at %s fps kept at full rate (hfr_max_fps = 0); "
+                "expect well below real time" % (pr["w"], pr["h"], _fmt_rate(fps)))
+        return None, False, ""
+    if fps <= max_fps:
+        return None, False, ""
+    target = fps
+    while target > max_fps:
+        target /= 2
+    _, client = _output_rate(argv, input_idx)
+    if client is not None and client < target:
+        target = client          # a client cap is lower still: never raise it
+    kept = measure_kept()
+    use_noref = kept is not None and fps * Fraction(kept).limit_denominator(1000) >= target
+    if use_noref:
+        how = "noref keeps %d%%" % round(100 * kept)
+    else:
+        how = ("noref would keep only %s fps, so fps= alone; likely below real "
+               "time" % _fmt_rate(fps * Fraction(kept).limit_denominator(1000))
+               if kept is not None else "noref share unknown, so fps= alone; "
+               "likely below real time")
+    return target, use_noref, (" hfr=%s->%s fps (4K above %s fps is not "
+                               "real-time here; %s)" % (_fmt_rate(fps),
+                               _fmt_rate(target), max_fps, how))
+
+
+def _fmt_rate(f):
+    return ("%.3f" % float(f)).rstrip("0").rstrip(".")
 
 
 def _dv_profile(st):
@@ -555,8 +656,27 @@ def decide(argv, cfg, ffprobe_bin, acquire):
         return encoder_only(argv, p, ffprobe_bin, enc_target, box,
                             "no rule matched", pr)
     name, hwaccel_args, graph = chosen
+    hfr_note = ""
+    if "-hwaccel" in hwaccel_args:
+        target, use_noref, hfr_note = hfr_plan(
+            cfg, pr, argv, p["input_idx"],
+            lambda: noref_kept(real_binary(cfg, "ffmpeg", "ffmpeg"), p["input"]))
+        if target is not None:
+            # Regularise to the target BEFORE the unpack, so neither the unpack
+            # nor the encode sees the frames that are thrown away -- and when
+            # enough survive, don't even decode them.
+            if use_noref:
+                hwaccel_args = ["-skip_frame", "noref"] + hwaccel_args
+            graph = "fps=%s,%s" % (target, graph)
     new_argv = build_argv(argv, p, hwaccel_args, graph, enc_target)
+    if hfr_note:
+        # A client-requested output -r above the target would re-duplicate the
+        # dropped frames (and ask the encoder for a level it can't sustain).
+        r_idx, r_val = _output_rate(new_argv, new_argv.index("-i"))
+        if r_idx is not None and r_val != target:
+            new_argv[r_idx + 1] = str(target)
     enc_note = (" enc=%s->%s" % (out_codec, enc_target)) if enc_target else ""
+    enc_note += hfr_note
     dv_note = (" dv=P%s" % pr["dv"]) if pr.get("dv") else ""
     if subtitles:
         enc_note += " subs=burn-in"

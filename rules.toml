@@ -99,6 +99,32 @@ burn_in = "hwdownload,format=yuv420p,{subtitles}"
 # Every command the shim leaves alone logs "[rpi-orch] passthrough: <why>" into
 # Jellyfin's per-transcode log.
 
+# High frame rate. The encoder is only real-time-capable at H.264 level 4.0 and
+# refuses to stream when the *declared* frame rate exceeds a level's limit, so a
+# 1080p50/60 output needs level 4.2. The fork's h264_v4l2m2m selects that level
+# itself (1080p50/60 then measures 1.02-1.38x), so nothing is done here for it.
+#
+# 4K above 30 fps is a different wall: decoding plus unpacking 4K at 50/60 fps
+# saturates the memory bus at any output size (0.54-0.59x on four real 4K60
+# sources). On the hardware-decode rules such a source is halved -- repeatedly,
+# until at or below hfr_max_fps -- with fps= before the unpack, so neither the
+# unpack nor the encode sees the discarded frames.
+#
+# When enough frames are non-reference, they aren't even decoded
+# (-skip_frame noref). How many that is depends entirely on the encode -- 33% to
+# 100% kept on five real 4K60 files -- so the shim measures it first, by stream
+# copy through filter_units (no decode, ~0.3 s), and uses noref only if what it
+# keeps still covers the target rate. Otherwise fps= would pad the gaps with
+# repeated frames: fewer unique frames than the log claims, unevenly spaced.
+#   noref + fps=   0.86-1.14x          fps= alone   0.57-0.90x (even cadence)
+# Neither is a guarantee of real time on 4K60, and the log says which applied:
+# "hfr=60->30 fps (...; noref keeps 67%)" or "(...; fps= alone; likely below
+# real time)". A client's own lower cap (Jellyfin's output -r) is kept.
+#
+# hfr_max_fps = 0 turns it off: full rate, logged as not expected to be real time.
+hfr_max_fps    = 30
+hfr_min_pixels = 2088960   # sources above 1920x1088 count as "4K" here
+
 # --- rules, first match wins -------------------------------------------------
 
 # Exact 2:1 (e.g. 4K -> 1080p): out=half lands on the target, so the ISP scale

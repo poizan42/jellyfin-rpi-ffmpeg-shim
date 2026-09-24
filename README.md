@@ -173,6 +173,25 @@ slower, but never a CMA failure. There is no autodetection: `CmaFree` is a
 famously misleading number (it counts pages that are movable-but-not-free), so
 the shim asks you for a slot count instead of guessing one.
 
+### High frame rate
+
+- **1080p50/60** needs nothing from the shim. The bcm2835 encoder refuses to
+  stream when the *declared* frame rate exceeds its H.264 level's limit, and it
+  defaulted to level 4.0, which rejects every 1080p50/60 encode (a bare `ESRCH`
+  at STREAMON). The fork's `h264_v4l2m2m` now selects level 4.2 itself; with an
+  older fork build these transcodes fail loudly.
+- **4K above 30 fps** is decode + unpack bound on the shared memory bus at any
+  output size (0.54–0.59× on real 4K60 sources), so on the hardware-decode rules
+  it is halved (`hfr_max_fps`, `hfr_min_pixels`): `fps=` before the unpack, plus
+  `-skip_frame noref` when the stream has enough non-reference frames to cover
+  the target rate. That share varies from 33% to 100% between encodes, so it is
+  measured first, by stream copy through `filter_units` (no decode, ~0.3 s).
+  Without that check, `fps=` would pad the gaps with repeated frames. A client's
+  lower `-r` cap is kept; one above the target is lowered to it. Logged as
+  `hfr=60->30 fps (...; noref keeps 67%)` or `(...; fps= alone; likely below
+  real time)`, because neither variant guarantees real time on 4K60
+  (0.86–1.14× with noref, 0.57–0.90× without).
+
 ## The rule file (`rules.toml`)
 
 `when` is a Python expression evaluated with **no builtins** against a fixed fact
