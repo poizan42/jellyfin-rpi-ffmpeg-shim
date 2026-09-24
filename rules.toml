@@ -14,7 +14,11 @@
 #   hw_decodable            (rpivid can decode it: hevc, 4:2:0, 8/10-bit, <=4K)
 #   tm                      (tm_hdr if the SOURCE is HDR -> we tonemap to SDR,
 #                            else "none"; independent of whether Jellyfin asked)
-# `vf` is a Python str.format template over those same facts.
+#   subs                    (Jellyfin is burning in a text subtitle)
+#   subtitles               (that subtitle filter, verbatim, e.g. "subtitles=f='...'")
+# `vf` is a Python str.format template over those same facts. When `subs` is
+# true, a rule's `vf_subs` is used instead if it has one; otherwise `burn_in`
+# (below) is appended to its `vf`.
 #
 # NOTE: `when` is eval()'d. This is a local, trusted, root-owned config; if that
 # ever stops being true, replace the evaluator before shipping.
@@ -79,6 +83,22 @@ slot_dir = "/tmp/rpi-orch-slots"
 # `accurate` for best quality on the quality-sensitive DV-P5/720p case.
 tm_hdr = "veryfast"
 
+# Text-subtitle burn-in. Jellyfin draws subtitles into the picture with libass,
+# which needs CPU frames, while every hardware rule below ends in DRM_PRIME
+# frames. So a rule without its own `vf_subs` gets this appended: download the
+# (already scaled, already tone-mapped) frame, burn in at the output size, and
+# hand the encoder plain yuv420p. Measured on a 1080p 10-bit HEVC anime episode
+# with dense typesetting: 2.43x at a 720p target, vs 0.83x on the all-software
+# path it replaces. Needs a fork whose scale_v4l2m2m publishes an output frames
+# context (hwdownload refuses its frames otherwise).
+burn_in = "hwdownload,format=yuv420p,{subtitles}"
+
+# Commands the hardware graph can't take (a -filter_complex graphical-subtitle
+# overlay, a deinterlacer, no recognisable scale) keep Jellyfin's software graph,
+# but a software H.264 encode is still redirected to h264_v4l2m2m (<=1920x1088).
+# Every command the shim leaves alone logs "[rpi-orch] passthrough: <why>" into
+# Jellyfin's per-transcode log.
+
 # --- rules, first match wins -------------------------------------------------
 
 # Exact 2:1 (e.g. 4K -> 1080p): out=half lands on the target, so the ISP scale
@@ -98,6 +118,29 @@ when    = "hw_decodable and src_w >= 2 * out_w"
 hw_slot = true
 args    = ["-hwaccel", "drm", "-hwaccel_output_format", "drm_prime"]
 vf      = "sand_to_yuv420p_drm=tm={tm}:out=half,scale_v4l2m2m={out_w}:{out_h}"
+
+# No resize at all (e.g. 1080p -> 1080p): the ISP scale would be an identity
+# pass. Skipping it measured 2.13x -> 2.41x on a 1080p 10-bit HEVC source, the
+# same effect as the exact-half rule above.
+#
+# With an SDR subtitle burn-in the frames have to reach the CPU anyway, so let
+# the decoder's NEON SAND download produce them directly instead of unpacking
+# into a dma-buf and reading it back: 2.02x vs 1.82x. HDR still needs the
+# filter's tone-map, so it takes the rule after this one.
+[[rule]]
+name    = "hw decode, no scale, SDR burn-in (NEON download)"
+when    = "hw_decodable and subs and not src_hdr and out_w == src_w and out_h == src_h"
+hw_slot = true
+args    = ["-hwaccel", "drm", "-hwaccel_output_format", "yuv420p"]
+vf      = "{subtitles}"
+vf_subs = "{subtitles}"
+
+[[rule]]
+name    = "hw decode, no scale (no ISP)"
+when    = "hw_decodable and out_w == src_w and out_h == src_h"
+hw_slot = true
+args    = ["-hwaccel", "drm", "-hwaccel_output_format", "drm_prime"]
+vf      = "sand_to_yuv420p_drm=tm={tm}"
 
 [[rule]]
 name    = "hw decode"

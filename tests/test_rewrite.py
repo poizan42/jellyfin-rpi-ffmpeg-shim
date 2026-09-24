@@ -315,5 +315,151 @@ class TestUnknownEncoderIsNotAbsorbed(unittest.TestCase):
             self.assertIsNotNone(run(argv, stub_probe()), acodec)
 
 
+def jf_burnin_cmd(max_w=1920, max_h=1080, sub="subtitles=f='/subs/0c/2.ass':fontsdir='/att/0c'",
+                  codec="libx264"):
+    """Jellyfin's text-subtitle burn-in shape, as captured from a live log:
+    the subtitles filter is the last filter of the software chain."""
+    vf = (r"setparams=color_primaries=bt709:color_trc=bt709:colorspace=bt709,"
+          r"scale=trunc(min(max(iw\,ih*a)\,min(%d\,%d*a))/2)*2:"
+          r"trunc(min(max(iw/a\,ih)\,min(%d/a\,%d))/2)*2,format=yuv420p,%s"
+          % (max_w, max_h, max_w, max_h, sub))
+    return ["-analyzeduration", "200M", "-probesize", "1G", "-f", "matroska",
+            "-i", "file:/anime/x.mkv", "-map_metadata", "-1", "-threads", "0",
+            "-map", "0:0", "-map", "0:1", "-codec:v:0", codec,
+            "-preset", "veryfast", "-crf", "23", "-maxrate", "7364903",
+            "-bufsize", "14729806", "-vf", vf, "-codec:a:0", "copy",
+            "-f", "hls", "-y", "/cache/out.m3u8"]
+
+
+def sdr1080(**kw):
+    base = dict(w=1920, h=1080, bit_depth=10, pix_fmt="yuv420p10le", hdr=False)
+    base.update(kw)
+    return stub_probe(**base)
+
+
+class Logged:
+    """Capture the shim's log lines for the duration of a with-block."""
+    def __enter__(self):
+        self.lines, self._orig = [], shim.log
+        shim.log = self.lines.append
+        return self
+
+    def __exit__(self, *exc):
+        shim.log = self._orig
+
+
+class TestSubtitleBurnIn(unittest.TestCase):
+    SUB = "subtitles=f='/subs/0c/2.ass':fontsdir='/att/0c'"
+
+    def _vf(self, res):
+        self.assertIsNotNone(res)
+        new, decision = res
+        return new[new.index("-vf") + 1], new, decision
+
+    def test_production_case_1080p_sdr_same_size(self):
+        # The session that exposed this: 1080p 10-bit SDR HEVC, 1080p target,
+        # ASS burn-in, libx264 requested. Used to pass through to an all-software
+        # transcode at 0.83x.
+        vf, new, decision = self._vf(run(jf_burnin_cmd(), sdr1080()))
+        self.assertEqual(vf, self.SUB)                         # NEON-download rule
+        i = new.index("-i")
+        self.assertEqual(new[i - 4:i], ["-hwaccel", "drm",
+                                        "-hwaccel_output_format", "yuv420p"])
+        self.assertEqual(new[new.index("-codec:v:0") + 1], "h264_v4l2m2m")
+        self.assertIn("subs=burn-in", decision)
+
+    def test_hdr_same_size_keeps_the_tonemap(self):
+        vf, _, _ = self._vf(run(jf_burnin_cmd(), sdr1080(hdr=True)))
+        self.assertEqual(vf, "sand_to_yuv420p_drm=tm=%s,hwdownload,format=yuv420p,%s"
+                         % (TM, self.SUB))
+
+    def test_4k_hdr_downscale_burns_in_after_the_isp(self):
+        vf, _, _ = self._vf(run(jf_burnin_cmd(1280, 720), stub_probe()))
+        self.assertEqual(vf, "sand_to_yuv420p_drm=tm=%s:out=half,"
+                         "scale_v4l2m2m=1280:720,hwdownload,format=yuv420p,%s"
+                         % (TM, self.SUB))
+
+    def test_tail_is_verbatim_commas_in_path_and_setpts(self):
+        sub = r"subtitles=f='/subs/a\,b, c/2.ass':charenc=UTF-8:fontsdir='/f',setpts=PTS -12/TB"
+        vf, _, _ = self._vf(run(jf_burnin_cmd(1280, 720, sub=sub), sdr1080()))
+        self.assertTrue(vf.endswith(",hwdownload,format=yuv420p," + sub), vf)
+
+    def test_h264_source_burns_in_after_the_isp(self):
+        probe = stub_probe(codec="h264", w=1920, h=1080, pix_fmt="yuv420p",
+                           bit_depth=8, hdr=False)
+        vf, new, _ = self._vf(run(jf_burnin_cmd(1280, 720), probe))
+        self.assertEqual(vf, "scale_v4l2m2m=1280:720,hwdownload,format=yuv420p,"
+                         + self.SUB)
+        self.assertIn("-no_cvt_hw", new)
+
+    def test_no_subs_same_size_skips_the_isp(self):
+        vf, _, _ = self._vf(run(jf_cmd(jf_vf(1920, 1080)),
+                                sdr1080(bit_depth=8, pix_fmt="yuv420p")))
+        self.assertEqual(vf, "sand_to_yuv420p_drm=tm=none")
+
+
+class TestEncoderOnlyRedirect(unittest.TestCase):
+    """Graphs the hardware graph can't take keep Jellyfin's software filters,
+    but a software H.264 encode still moves to the hardware encoder."""
+
+    def test_graphical_subtitle_overlay(self):
+        fc = ("[0:3]scale=1920:1080[sub];[0:0]setparams=colorspace=bt709,"
+              "scale=1920:1080,format=yuv420p[main];[main][sub]overlay=eof_action=pass")
+        argv = ["-i", "/x.mkv", "-filter_complex", fc, "-codec:v:0", "libx264",
+                "-preset", "veryfast", "-crf", "23", "-maxrate", "8M", "-y", "/o.ts"]
+        res = run(argv, sdr1080())
+        self.assertIsNotNone(res)
+        new, decision = res
+        self.assertEqual(new[new.index("-filter_complex") + 1], fc)   # untouched
+        self.assertEqual(new[new.index("-codec:v:0") + 1], "h264_v4l2m2m")
+        self.assertEqual(new[new.index("-b:v") + 1], "8M")
+        self.assertNotIn("-crf", new)
+        self.assertNotIn("-hwaccel", new)
+        self.assertIn("encoder-only", decision)
+
+    def test_deinterlacer(self):
+        vf = "yadif=0:-1:0," + jf_vf(1280, 720)
+        new, _ = run(jf_cmd(vf, codec="libx264"), sdr1080())
+        self.assertEqual(new[new.index("-vf") + 1], vf)
+        self.assertEqual(new[new.index("-codec:v:0") + 1], "h264_v4l2m2m")
+
+    def test_output_over_the_encoder_limit_passes_through(self):
+        argv = ["-i", "/x.mkv", "-filter_complex", "[0:0][0:3]overlay",
+                "-codec:v:0", "libx264", "-y", "/o.ts"]
+        with Logged() as lg:
+            self.assertIsNone(run(argv, stub_probe(w=3840, h=2160)))
+        self.assertTrue(any("exceeds" in l for l in lg.lines), lg.lines)
+
+    def test_foreign_hardware_graph_is_left_alone(self):
+        vf = "hwupload=derive_device=vaapi," + jf_vf(1280, 720)
+        with Logged() as lg:
+            self.assertIsNone(run(jf_cmd(vf, codec="libx264"), sdr1080()))
+        self.assertTrue(any("passthrough:" in l and "hwupload" in l
+                            for l in lg.lines), lg.lines)
+
+
+class TestEveryPassthroughSaysWhy(unittest.TestCase):
+    def test_transcode_passthroughs_are_logged(self):
+        cases = [
+            jf_cmd(jf_vf(1280, 720)) + ["-filter_complex", "[0:v][0:s]overlay"],
+            ["-i", "/x.mkv", "-codec:v:0", "h264_v4l2m2m", "-y", "/o.mp4"],
+            jf_cmd("yadif=0:-1:0," + jf_vf(1280, 720)),
+        ]
+        for argv in cases:
+            with Logged() as lg:
+                self.assertIsNone(run(argv, stub_probe()))
+            self.assertTrue(any(l.startswith("passthrough: ") for l in lg.lines),
+                            (argv, lg.lines))
+
+    def test_non_transcodes_stay_silent(self):
+        # Jellyfin parses the output of its capability probes; keep them clean.
+        for argv in (["-version"], ["-encoders"], ["-hwaccels"],
+                     ["-f", "lavfi", "-i", "nullsrc", "-c:v", "libx264", "-f", "null", "-"],
+                     jf_cmd(jf_vf(1280, 720), codec="libx265")):
+            with Logged() as lg:
+                self.assertIsNone(run(argv, stub_probe()))
+            self.assertEqual(lg.lines, [], argv)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

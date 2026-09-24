@@ -44,9 +44,10 @@ Three facts, established by measurement on a Pi 4, make a decision layer
   ones — and the filters are where nearly all the CPU goes. Either way, swapping
   the binary alone
   would not exercise the hardware pipeline; something has to rewrite the command.
-  The shim does that, matching only what it positively recognises and passing
-  through anything else — including graph shapes from other configurations
-  (`hwupload`/`hwmap`/`overlay`/deinterlace are all on the passthrough list).
+  The shim does that, matching only what it positively recognises. Graphs it
+  can't rebuild in hardware still get their software H.264 encode moved to the
+  hardware encoder, and only graphs from other hardware configurations
+  (`hwupload`/`hwmap`/…) are passed through untouched.
 
 ## Layout
 
@@ -66,21 +67,34 @@ tests/         test_rewrite.py (pure golden-rewrite unit tests, no hardware)
 
 ## What it does, step by step
 
-1. **Cheap gate** (never probes for non-transcodes): engage only if the output
-   video encoder is one of `hw_encoders` **or a software H.264 encoder we redirect**
-   (`h264_sw_encoders`, e.g. `libx264` → `h264_v4l2m2m` — a software H.264 encode
-   can't keep up in real time, so Jellyfin asking for `libx264` must still land on
-   the hardware encoder), there's a `-vf` (not `-filter_complex`), a real file
-   input, `scale` is present, and no disallowed filter is in the chain (`overlay`,
-   `subtitles`, deinterlace, `hwupload/hwmap/hwdownload`, or our own filters — see
-   `DISALLOWED`). Anything else → immediate passthrough. (No HW HEVC *encoder* on
-   the Pi 4, so `libx265` is not redirected — it passes through.)
-2. **Read the target box** from Jellyfin's `scale=` expression (the first two
-   resolution-plausible integers are its `maxWidth,maxHeight`), and note whether it
-   asked to tone-map (`tonemap` substring → `tm=accurate`, else `tm=none`).
+1. **Cheap gate** (never probes for non-transcodes, and stays silent for them):
+   engage only if the output video encoder is one of `hw_encoders` **or a software
+   H.264 encoder we redirect** (`h264_sw_encoders`, e.g. `libx264` → `h264_v4l2m2m`
+   — a software H.264 encode can't keep up in real time, so Jellyfin asking for
+   `libx264` must still land on the hardware encoder) and there is a real file
+   input. (No HW HEVC *encoder* on the Pi 4, so `libx265` is not redirected — it
+   passes through.)
+2. **Classify the filter graph** — three outcomes:
+   - **hardware graph**: a `-vf` with a recognisable `scale` box. A trailing
+     text-subtitle burn-in (`subtitles=…`, always the last filter Jellyfin emits) is
+     lifted off verbatim and re-attached after the hardware graph (`burn_in`).
+   - **encoder-only**: `-filter_complex` (e.g. a graphical-subtitle `overlay`), a
+     deinterlacer, no `-vf`, or no recognisable box. Jellyfin's software graph is
+     kept, but a redirected software H.264 encode still moves to `h264_v4l2m2m`,
+     provided the output fits its 1920×1088 limit.
+   - **passthrough**: the graph already uses hardware frames (`hwupload`, `hwmap`,
+     `hwdownload`) or already contains our own filters.
+
+   Each outcome is logged into Jellyfin's per-transcode ffmpeg log, as either
+   `[rpi-orch] engaged: …` or `[rpi-orch] passthrough: <reason>`, so "why isn't this
+   on the hardware?" is answered in the log.
+   Then **read the target box** from Jellyfin's `scale=` expression (the first two
+   resolution-plausible integers are its `maxWidth,maxHeight`).
 3. **Probe the source once** with the fork's ffprobe: codec, dimensions, pix_fmt,
    bit depth, chroma, HDR transfer. Compute `hw_decodable` (hevc, 4:2:0, 8/10-bit,
    ≤4K) and the fitted output size (aspect-preserving, no upscale, width/64 × /2).
+   The tone-map tier comes from the *source*: `tm_hdr` if it is HDR (including
+   Dolby Vision), else `none`, whatever Jellyfin's graph asked for.
 4. **Evaluate rules**, first match wins. A rule that needs a hardware slot is
    skipped if none is free, so the software rule is the guaranteed fallback.
 5. **Rewrite argv**: swap the `-vf` graph, insert the rule's hwaccel args before
@@ -163,6 +177,10 @@ the shim asks you for a slot count instead of guessing one.
 
 `when` is a Python expression evaluated with **no builtins** against a fixed fact
 namespace; `vf` is a `str.format` template over the same facts. First match wins.
+When a text subtitle is being burned in, a rule's `vf_subs` template is used
+instead if it has one; otherwise the top-level `burn_in` template
+(`hwdownload,format=yuv420p,{subtitles}`) is appended to its `vf`. That needs a
+fork whose `scale_v4l2m2m` publishes an output frames context.
 
 Facts available to `when` / `vf`:
 
@@ -171,7 +189,10 @@ Facts available to `when` / `vf`:
 | `src_codec` `src_w` `src_h` `src_pix_fmt` `src_bit_depth` `src_chroma` `src_hdr` | probed source |
 | `out_w` `out_h` | fitted output size (aspect-preserving, /64 × /2) |
 | `hw_decodable` | rpivid can decode it (hevc, 4:2:0, 8/10-bit, ≤4K) |
-| `tm` | `"accurate"` if Jellyfin asked to tone-map, else `"none"` |
+| `h264_hw_decodable` | the bcm2835 H.264 decoder can take it (≤1080p, 8-bit 4:2:0, progressive) |
+| `tm` | `tm_hdr` if the source is HDR (incl. Dolby Vision), else `"none"` |
+| `subs` | Jellyfin is burning in a text subtitle |
+| `subtitles` | that subtitle filter, verbatim (quoted path and all) |
 
 `true`/`false`/`null` are accepted as aliases of Python's `True`/`False`/`None`, so
 TOML authors can write lowercase.

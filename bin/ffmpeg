@@ -24,13 +24,34 @@ import subprocess
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from _orch import load_config, real_binary, exec_real, log  # noqa: E402
 
-# Filters we cannot faithfully reproduce in our graph — if Jellyfin's chain
-# contains one, leave the whole command to the software path untouched. Also
-# bail if our own filters are already present (don't double-process).
-DISALLOWED = re.compile(
-    r"(?:^|[,;=\s])(?:overlay|subtitles|ass|hwupload|hwmap|hwdownload|"
-    r"yadif|bwdif|w3fdif|estdif|deinterlace|sand_to_yuv420p_drm|scale_v4l2m2m)"
-    r"(?:[=,;\s]|$)")
+# What Jellyfin's filter graph contains decides how much of the command we can
+# take over. Three outcomes, and every one of them is logged:
+#
+# FOREIGN_HW — the graph already moves frames to/from some hardware context, or
+# our own filters are already in it. Its output may not be plain CPU frames, so
+# not even the encoder can safely change: the command passes through untouched.
+FOREIGN_HW = re.compile(
+    r"(?:^|[,;=\s\]])(?:hwupload|hwmap|hwdownload|sand_to_yuv420p_drm|"
+    r"scale_v4l2m2m|deinterlace_v4l2m2m)(?:[=,;\s\[]|$)")
+# SW_ONLY — filters our hardware graph cannot reproduce (deinterlacers, a
+# graphical-subtitle overlay). Jellyfin's software graph is kept, but it still
+# ends in plain 8-bit CPU frames, so a software H.264 encode still moves to the
+# hardware encoder: the expensive half of the job leaves the CPU either way.
+SW_ONLY = re.compile(
+    r"(?:^|[,;=\s\]])(?:overlay|yadif|bwdif|w3fdif|estdif|deinterlace)"
+    r"(?:[=,;\s\[]|$)")
+# A text-subtitle burn-in. Jellyfin always makes it the LAST filter of its
+# software chain (optionally followed by a setpts), so it is lifted off as a
+# verbatim tail — its quoted, escaped path may contain commas, so it is never
+# split — and re-attached after the hardware graph (see `burn_in` in
+# rules.toml). The classifiers above only look at the part before it, so a
+# subtitle *path* can't trip them.
+_SUBS_TAIL = re.compile(r"(?:^|(?<!\\),)((?:subtitles|ass)=.*)\Z", re.S)
+_DEFAULT_BURN_IN = "hwdownload,format=yuv420p,{subtitles}"
+
+# The H.264 hardware encoder's size limit. Beyond it the encode fails outright,
+# so an encoder-only redirect is not attempted (the command passes through).
+_ENC_MAX_W, _ENC_MAX_H = 1920, 1088
 
 _CODEC_RE = re.compile(r"^-(?:c|codec|vcodec):v(?::\d+)?$")
 _VF_FLAGS = ("-vf", "-filter:v")
@@ -64,7 +85,7 @@ def parse_argv(argv):
     when absent. Never raises."""
     out = {"input": None, "input_idx": None, "out_codec": None,
            "vf_flag": None, "vf_idx": None, "vf_val": None,
-           "filter_complex": False}
+           "filter_complex": False, "fc_val": None}
     i = 0
     n = len(argv)
     while i < n:
@@ -89,6 +110,10 @@ def parse_argv(argv):
             continue
         if tok == "-filter_complex":
             out["filter_complex"] = True
+            if i + 1 < n:
+                out["fc_val"] = argv[i + 1]
+                i += 2
+                continue
         i += 1
     return out
 
@@ -238,7 +263,7 @@ def _chroma(pix):
     return "?"
 
 
-def build_facts(p, out_w, out_h, tm):
+def build_facts(p, out_w, out_h, tm, subtitles=None):
     hw_decodable = (
         p["codec"] == "hevc" and p["chroma"] == "420"
         and p["bit_depth"] in (8, 10)
@@ -260,6 +285,7 @@ def build_facts(p, out_w, out_h, tm):
         "out_w": out_w, "out_h": out_h,
         "hw_decodable": hw_decodable,
         "h264_hw_decodable": h264_hw_decodable, "tm": tm,
+        "subs": subtitles is not None, "subtitles": subtitles or "",
     }
 
 
@@ -284,7 +310,16 @@ def choose(cfg, facts, acquire):
                 % rule.get("name"))
             continue
         try:
-            graph = rule["vf"].format(**facts)
+            if facts.get("subs") and "vf_subs" in rule:
+                graph = rule["vf_subs"].format(**facts)
+            elif facts.get("subs"):
+                # The rule's graph ends in DRM_PRIME frames; libass draws on CPU
+                # frames, so bring them back, burn in, and hand the encoder
+                # plain yuv420p (h264_v4l2m2m takes either).
+                graph = (rule["vf"].format(**facts) + "," +
+                         cfg.get("burn_in", _DEFAULT_BURN_IN).format(**facts))
+            else:
+                graph = rule["vf"].format(**facts)
         except Exception as exc:
             log("rule '%s' graph format error: %s" % (rule.get("name"), exc))
             return None
@@ -413,6 +448,34 @@ def make_acquirer(cfg):
     return acquire
 
 
+def _passthrough(reason):
+    log("passthrough: %s" % reason)
+    return None
+
+
+def encoder_only(argv, p, ffprobe_bin, enc_target, box, reason, pr=None):
+    """Keep Jellyfin's software graph but move a software H.264 encode to the
+    hardware encoder. Its graph ends in plain 8-bit CPU frames, which
+    h264_v4l2m2m takes as-is. Only the output size can rule it out."""
+    if enc_target is None:
+        return _passthrough("%s; the encoder is already hardware" % reason)
+    if pr is None:
+        pr = probe(ffprobe_bin, p["input"])
+    if pr is None or pr["w"] <= 0 or pr["h"] <= 0:
+        return _passthrough("%s; and the source could not be probed, so the "
+                            "output size is unknown" % reason)
+    fitted = fit(pr["w"], pr["h"], box[0], box[1], wmult=2) if box else None
+    out_w, out_h = fitted or (pr["w"], pr["h"])
+    if out_w > _ENC_MAX_W or out_h > _ENC_MAX_H:
+        return _passthrough("%s; and the %dx%d output exceeds %s's %dx%d limit"
+                            % (reason, out_w, out_h, enc_target,
+                               _ENC_MAX_W, _ENC_MAX_H))
+    return (rewrite_encoder(argv, enc_target),
+            "encoder-only (%s): enc=%s->%s, Jellyfin's software graph kept, "
+            "src=%s %dx%d -> ~%dx%d" % (reason, p["out_codec"], enc_target,
+                                        pr["codec"], pr["w"], pr["h"], out_w, out_h))
+
+
 def decide(argv, cfg, ffprobe_bin, acquire):
     """Full decision. Returns (new_argv, decision_str) to run, or None to pass
     the original command through unchanged. Pure except for probe + acquire,
@@ -431,14 +494,38 @@ def decide(argv, cfg, ffprobe_bin, acquire):
     elif out_codec in h264_sw:
         enc_target = _HW_H264
     else:
-        return None
-    if p["filter_complex"] or p["vf_flag"] is None:
-        return None
+        return None           # not a video transcode we handle: silent
     if p["input"] is None:
-        return None
+        return None           # lavfi/pipe test invocation, not a transcode: silent
+
+    # From here on this IS a video transcode we want on the hardware, so every
+    # way out says why. A silent passthrough looks exactly like "the hardware
+    # just isn't being used", and is undiagnosable from Jellyfin's log.
     vf = p["vf_val"] or ""
-    if "scale" not in vf or DISALLOWED.search(vf):
-        return None
+    m = _SUBS_TAIL.search(vf)
+    subtitles = m.group(1) if m else None
+    head = vf[:m.start(1)] if m else vf
+    graph_src = (p["fc_val"] or "") if p["filter_complex"] else head
+    fm = FOREIGN_HW.search(graph_src)
+    if fm:
+        return _passthrough("filter graph already uses hardware frames (%r); "
+                            "leaving the whole command alone" % fm.group(0).strip(",;= "))
+
+    if p["filter_complex"]:
+        return encoder_only(argv, p, ffprobe_bin, enc_target, None,
+                            "-filter_complex graph (e.g. a graphical-subtitle "
+                            "overlay) is not rewritten")
+    if p["vf_flag"] is None:
+        return encoder_only(argv, p, ffprobe_bin, enc_target, None, "no -vf")
+    sm = SW_ONLY.search(head)
+    if sm:
+        return encoder_only(argv, p, ffprobe_bin, enc_target, extract_box(head),
+                            "graph needs %r, which the hardware graph can't "
+                            "reproduce" % sm.group(0).strip(",;= "))
+    box = extract_box(head) if "scale" in head else None
+    if box is None:
+        return encoder_only(argv, p, ffprobe_bin, enc_target, None,
+                            "no recognisable scale box in -vf")
 
     # NB: deliberately *no* runtime "can the fork provide every encoder this
     # command names?" check here. If the fork is missing one (this bit us with
@@ -447,13 +534,9 @@ def decide(argv, cfg, ffprobe_bin, acquire):
     # in the fork build or in these rules. install.sh diffs the fork's encoder
     # list against the stock build at deploy time so the gap surfaces there.
 
-    box = extract_box(vf)
-    if box is None:
-        return None
-
     pr = probe(ffprobe_bin, p["input"])
     if pr is None or pr["w"] <= 0 or pr["h"] <= 0:
-        return None
+        return _passthrough("could not probe the source")
 
     fitted = fit(pr["w"], pr["h"], box[0], box[1])
     if fitted is None:
@@ -465,15 +548,18 @@ def decide(argv, cfg, ffprobe_bin, acquire):
     # 10->8, which washes HDR out. We're emitting 8-bit SDR H.264, so if the probe
     # says the source is HDR, our filter must do the PQ/HLG->SDR conversion itself.
     tm = cfg.get("tm_hdr", "accurate") if pr["hdr"] else "none"
-    facts = build_facts(pr, out_w, out_h, tm)
+    facts = build_facts(pr, out_w, out_h, tm, subtitles)
 
     chosen = choose(cfg, facts, acquire)
     if chosen is None:
-        return None
+        return encoder_only(argv, p, ffprobe_bin, enc_target, box,
+                            "no rule matched", pr)
     name, hwaccel_args, graph = chosen
     new_argv = build_argv(argv, p, hwaccel_args, graph, enc_target)
     enc_note = (" enc=%s->%s" % (out_codec, enc_target)) if enc_target else ""
     dv_note = (" dv=P%s" % pr["dv"]) if pr.get("dv") else ""
+    if subtitles:
+        enc_note += " subs=burn-in"
     decision = ("rule=%r src=%s %dx%d %db %s hdr=%s%s -> out=%dx%d%s vf=%r"
                 % (name, pr["codec"], pr["w"], pr["h"], pr["bit_depth"],
                    pr["chroma"], pr["hdr"], dv_note, out_w, out_h, enc_note, graph))
