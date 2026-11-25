@@ -16,9 +16,12 @@
 #                            else "none"; independent of whether Jellyfin asked)
 #   subs                    (Jellyfin is burning in a text subtitle)
 #   subtitles               (that subtitle filter, verbatim, e.g. "subtitles=f='...'")
-# `vf` is a Python str.format template over those same facts. When `subs` is
-# true, a rule's `vf_subs` is used instead if it has one; otherwise `burn_in`
-# (below) is appended to its `vf`.
+#   overlay                 (Jellyfin is overlaying a graphical subtitle: PGS etc.)
+#   cpu_out                 (subs or overlay: the graph must end in CPU frames)
+# `vf` is a Python str.format template over those same facts. When `cpu_out` is
+# true, the rule's `vf_cpu` is used instead if it has one -- its graph ending in
+# CPU frames -- otherwise `download` (below) is appended to its `vf`. A text
+# subtitle is then drawn at the end of that; a graphical one is overlaid onto it.
 #
 # NOTE: `when` is eval()'d. This is a local, trusted, root-owned config; if that
 # ever stops being true, replace the evaluator before shipping.
@@ -83,21 +86,27 @@ slot_dir = "/tmp/rpi-orch-slots"
 # `accurate` for best quality on the quality-sensitive DV-P5/720p case.
 tm_hdr = "veryfast"
 
-# Text-subtitle burn-in. Jellyfin draws subtitles into the picture with libass,
-# which needs CPU frames, while every hardware rule below ends in DRM_PRIME
-# frames. So a rule without its own `vf_subs` gets this appended: download the
-# (already scaled, already tone-mapped) frame, burn in at the output size, and
-# hand the encoder plain yuv420p. Measured on a 1080p 10-bit HEVC anime episode
-# with dense typesetting: 2.43x at a 720p target, vs 0.83x on the all-software
-# path it replaces. Needs a fork whose scale_v4l2m2m publishes an output frames
-# context (hwdownload refuses its frames otherwise).
-burn_in = "hwdownload,format=yuv420p,{subtitles}"
+# Subtitle burn-in. Jellyfin draws subtitles into the picture on CPU frames --
+# text with libass (`subtitles=` at the end of -vf), graphical ones (PGS, VobSub,
+# DVB) with an `overlay` in a -filter_complex -- while every hardware rule below
+# ends in DRM_PRIME frames. So a rule without its own `vf_cpu` gets this
+# appended: download the (already scaled, already tone-mapped) frame and burn in
+# at the output size; the encoder takes the plain yuv420p. For an overlay, the
+# shim rewrites only the video's chain of the -filter_complex and keeps
+# Jellyfin's subtitle chain, rescaled to the hardware path's output size.
+#   text, 1080p 10-bit HEVC anime, dense typesetting, 720p:  2.43x (sw: 0.83x)
+#   PGS, 1080p 10-bit HEVC film, 1080p (NEON download):       1.85x (sw: 1.12x)
+#   PGS, same film, 720p:                                     2.39x
+# Needs a fork whose scale_v4l2m2m publishes an output frames context (hwdownload
+# refuses its frames otherwise), and -- for the PGS numbers -- whose overlay
+# skips the transparent part of the subtitle canvas (1.62x without).
+download = "hwdownload,format=yuv420p"
 
-# Commands the hardware graph can't take (a -filter_complex graphical-subtitle
-# overlay, a deinterlacer, no recognisable scale) keep Jellyfin's software graph,
-# but a software H.264 encode is still redirected to h264_v4l2m2m (<=1920x1088).
-# Every command the shim leaves alone logs "[rpi-orch] passthrough: <why>" into
-# Jellyfin's per-transcode log.
+# Commands the hardware graph can't take (a deinterlacer, a -filter_complex
+# that isn't Jellyfin's subtitle overlay, no recognisable scale) keep Jellyfin's
+# software graph, but a software H.264 encode is still redirected to
+# h264_v4l2m2m (<=1920x1088). Every command the shim leaves alone logs
+# "[rpi-orch] passthrough: <why>" into Jellyfin's per-transcode log.
 
 # High frame rate. The encoder is only real-time-capable at H.264 level 4.0 and
 # refuses to stream when the *declared* frame rate exceeds a level's limit, so a
@@ -151,15 +160,15 @@ vf      = "sand_to_yuv420p_drm=tm={tm}:out=half,scale_v4l2m2m={out_w}:{out_h}"
 #
 # With an SDR subtitle burn-in the frames have to reach the CPU anyway, so let
 # the decoder's NEON SAND download produce them directly instead of unpacking
-# into a dma-buf and reading it back: 2.02x vs 1.82x. HDR still needs the
-# filter's tone-map, so it takes the rule after this one.
+# into a dma-buf and reading it back (empty `vf_cpu`: nothing left to do).
+# Text: 2.02x vs 1.82x; PGS: 1.85x vs 1.69x. HDR still needs the filter's
+# tone-map, so it takes the rule after this one.
 [[rule]]
 name    = "hw decode, no scale, SDR burn-in (NEON download)"
-when    = "hw_decodable and subs and not src_hdr and out_w == src_w and out_h == src_h"
+when    = "hw_decodable and cpu_out and not src_hdr and out_w == src_w and out_h == src_h"
 hw_slot = true
 args    = ["-hwaccel", "drm", "-hwaccel_output_format", "yuv420p"]
-vf      = "{subtitles}"
-vf_subs = "{subtitles}"
+vf_cpu  = ""
 
 [[rule]]
 name    = "hw decode, no scale (no ISP)"

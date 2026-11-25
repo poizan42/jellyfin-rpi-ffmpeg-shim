@@ -77,8 +77,16 @@ tests/         test_rewrite.py (pure golden-rewrite unit tests, no hardware)
 2. **Classify the filter graph** — three outcomes:
    - **hardware graph**: a `-vf` with a recognisable `scale` box. A trailing
      text-subtitle burn-in (`subtitles=…`, always the last filter Jellyfin emits) is
-     lifted off verbatim and re-attached after the hardware graph (`burn_in`).
-   - **encoder-only**: `-filter_complex` (e.g. a graphical-subtitle `overlay`), a
+     lifted off verbatim and re-attached after the hardware graph, once its frames
+     are back on the CPU (`vf_cpu` / `download`).
+   - **hardware graph under a subtitle overlay**: Jellyfin's graphical-subtitle
+     (PGS, VobSub, DVB) `-filter_complex` —
+     `[0:s]<sub chain>[sub];[0:v]<main chain>[main];[main][sub]overlay=…`. The main
+     chain is classified exactly like a `-vf` and replaced by the rule's CPU-frame
+     graph; the subtitle chain and the overlay are kept, with the subtitle canvas
+     rescaled to the hardware path's output size (Jellyfin sized it to its own
+     rounding of the box).
+   - **encoder-only**: any other `-filter_complex`, a
      deinterlacer, no `-vf`, or no recognisable box. Jellyfin's software graph is
      kept, but a redirected software H.264 encode still moves to `h264_v4l2m2m`,
      provided the output fits its 1920×1088 limit.
@@ -97,7 +105,7 @@ tests/         test_rewrite.py (pure golden-rewrite unit tests, no hardware)
    Dolby Vision), else `none`, whatever Jellyfin's graph asked for.
 4. **Evaluate rules**, first match wins. A rule that needs a hardware slot is
    skipped if none is free, so the software rule is the guaranteed fallback.
-5. **Rewrite argv**: swap the `-vf` graph, insert the rule's hwaccel args before
+5. **Rewrite argv**: swap the `-vf` graph (or the overlay's main chain), insert the rule's hwaccel args before
    the primary `-i`, and — if the input was a redirected software H.264 encoder —
    swap the encoder to `h264_v4l2m2m`, strip its libx264/libx265-only options
    (`-preset`, `-crf`, `-x264opts`, `-profile:v`, `-level`, `-sc_threshold`, …),
@@ -196,10 +204,20 @@ the shim asks you for a slot count instead of guessing one.
 
 `when` is a Python expression evaluated with **no builtins** against a fixed fact
 namespace; `vf` is a `str.format` template over the same facts. First match wins.
-When a text subtitle is being burned in, a rule's `vf_subs` template is used
-instead if it has one; otherwise the top-level `burn_in` template
-(`hwdownload,format=yuv420p,{subtitles}`) is appended to its `vf`. That needs a
-fork whose `scale_v4l2m2m` publishes an output frames context.
+When a subtitle is being burned in (`cpu_out`), the graph has to end in CPU
+frames: a rule's `vf_cpu` template is used instead if it has one; otherwise the
+top-level `download` chain (`hwdownload,format=yuv420p`) is appended to its `vf`.
+A text subtitle is then drawn at the end of that graph; a graphical one is
+overlaid onto it. Downloading needs a fork whose `scale_v4l2m2m` publishes an
+output frames context. (`vf_cpu`/`download` replace the earlier
+text-subtitles-only `vf_subs`/`burn_in`, which are no longer read.)
+
+Graphical subtitles also want a fork whose `overlay` skips the transparent part
+of the subtitle canvas: Jellyfin overlays a full-frame canvas, transparent but
+for a line or two of text, onto every frame, and stock `overlay` blends all of
+it in plain C on aarch64 — 40% of the CPU of a 1080p PGS transcode. Measured on
+a 1080p 10-bit HEVC film with PGS, 1080p target: 1.03× (software graph) → 1.62×
+(hardware decode) → 1.85× (plus the overlay fix); 2.39× at 720p.
 
 Facts available to `when` / `vf`:
 
@@ -212,6 +230,8 @@ Facts available to `when` / `vf`:
 | `tm` | `tm_hdr` if the source is HDR (incl. Dolby Vision), else `"none"` |
 | `subs` | Jellyfin is burning in a text subtitle |
 | `subtitles` | that subtitle filter, verbatim (quoted path and all) |
+| `overlay` | Jellyfin is overlaying a graphical subtitle (PGS, VobSub, DVB) |
+| `cpu_out` | `subs or overlay`: the graph must end in CPU frames |
 
 `true`/`false`/`null` are accepted as aliases of Python's `True`/`False`/`None`, so
 TOML authors can write lowercase.

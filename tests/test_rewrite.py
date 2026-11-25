@@ -400,13 +400,132 @@ class TestSubtitleBurnIn(unittest.TestCase):
         self.assertEqual(vf, "sand_to_yuv420p_drm=tm=none")
 
 
+def jf_pgs_fc(max_w=1920, max_h=1080, main=None, sub_idx=2):
+    """Jellyfin's graphical-subtitle -filter_complex, as captured from a live log
+    (1080p 10-bit HEVC with a PGS track, libx264 requested)."""
+    if main is None:
+        main = (r"setparams=color_primaries=bt709:color_trc=bt709:colorspace=bt709,"
+                r"scale=trunc(min(max(iw\,ih*a)\,min(%d\,%d*a))/2)*2:"
+                r"trunc(min(max(iw/a\,ih)\,min(%d/a\,%d))/2)*2,format=yuv420p"
+                % (max_w, max_h, max_w, max_h))
+    return ("[0:%d]scale,scale=%d:%d:fast_bilinear[sub];[0:0]%s[main];"
+            "[main][sub]overlay=eof_action=pass:repeatlast=0"
+            % (sub_idx, max_w, max_h, main))
+
+
+def jf_pgs_cmd(fc, codec="libx264"):
+    return ["-analyzeduration", "200M", "-probesize", "1G", "-f", "matroska",
+            "-canvas_size", "1920x1080", "-i", "file:/films/x.mkv",
+            "-map_metadata", "-1", "-map_chapters", "-1", "-threads", "0",
+            "-map", "0:0", "-map", "0:1", "-map", "-0:0",
+            "-codec:v:0", codec, "-preset", "veryfast", "-crf", "23",
+            "-maxrate", "8604463", "-bufsize", "17208926",
+            "-x264opts:0", "subme=0:me_range=16:rc_lookahead=10:me=hex:open_gop=0",
+            "-force_key_frames:0", "expr:gte(t,n_forced*3)",
+            "-filter_complex", fc, "-start_at_zero", "-codec:a:0", "libfdk_aac",
+            "-f", "hls", "-y", "/cache/out.m3u8"]
+
+
+class TestGraphicalSubtitleOverlay(unittest.TestCase):
+    """A PGS burn-in arrives as a -filter_complex overlay. Its video chain is
+    replaced by the hardware graph (ending in CPU frames); the subtitle chain and
+    the overlay are kept, the canvas rescaled to the hardware output size."""
+    SUB = "[0:2]scale,scale=%d:%d:fast_bilinear,scale=%d:%d:fast_bilinear[sub]"
+    OV = "overlay=eof_action=pass:repeatlast=0"
+
+    def _fc(self, res):
+        self.assertIsNotNone(res)
+        new, decision = res
+        self.assertNotIn("-vf", new)
+        return new[new.index("-filter_complex") + 1], new, decision
+
+    def test_production_case_1080p_sdr_same_size(self):
+        # The session that exposed this: 1080p 10-bit SDR HEVC + PGS, 1080p
+        # target, libx264. Was encoder-only: software HEVC decode, 0.91x.
+        fc, new, decision = self._fc(run(jf_pgs_cmd(jf_pgs_fc()), sdr1080()))
+        # NEON-download rule: decoder emits yuv420p, nothing left for [main].
+        self.assertEqual(fc, self.SUB % (1920, 1080, 1920, 1080)
+                         + ";[0:0][sub]" + self.OV)
+        i = new.index("-i")
+        self.assertEqual(new[i - 4:i], ["-hwaccel", "drm",
+                                        "-hwaccel_output_format", "yuv420p"])
+        self.assertEqual(new[new.index("-codec:v:0") + 1], "h264_v4l2m2m")
+        for gone in ("-crf", "-preset", "-x264opts:0", "libx264"):
+            self.assertNotIn(gone, new)
+        for keep in ("-canvas_size", "-map", "-0:0", "-start_at_zero"):
+            self.assertIn(keep, new)
+        self.assertIn("subs=overlay", decision)
+        self.assertIn("NEON download", decision)
+
+    def test_4k_hdr_downscale_overlays_after_the_isp(self):
+        fc, new, _ = self._fc(run(jf_pgs_cmd(jf_pgs_fc(1280, 720)), stub_probe()))
+        self.assertEqual(fc, self.SUB % (1280, 720, 1280, 720) + ";[0:0]"
+                         "sand_to_yuv420p_drm=tm=%s:out=half,scale_v4l2m2m=1280:720,"
+                         "hwdownload,format=yuv420p[main];[main][sub]%s" % (TM, self.OV))
+        self.assertIn("drm_prime", new)
+
+    def test_hdr_same_size_keeps_the_tonemap(self):
+        fc, _, _ = self._fc(run(jf_pgs_cmd(jf_pgs_fc()), sdr1080(hdr=True)))
+        self.assertIn("[0:0]sand_to_yuv420p_drm=tm=%s,hwdownload,format=yuv420p[main]"
+                      % TM, fc)
+
+    def test_canvas_follows_the_hardware_output_size(self):
+        # 2.40:1 film into a 1280x720 box: Jellyfin rounds to /2 (1280x534 canvas
+        # here), the hardware path to /64 x /2 (1280x532). The canvas is rescaled
+        # to ours, or the overlay would sit 2 lines off.
+        fc, _, decision = self._fc(run(jf_pgs_cmd(jf_pgs_fc(1280, 534)),
+                                       sdr1080(h=800)))
+        self.assertIn("out=1280x532", decision)
+        self.assertTrue(fc.startswith(
+            "[0:2]scale,scale=1280:534:fast_bilinear,scale=1280:532:fast_bilinear[sub];"),
+            fc)
+        self.assertIn("scale_v4l2m2m=1280:532,hwdownload,format=yuv420p[main]", fc)
+
+    def test_no_hw_slot_falls_to_software_decode_still_overlaid(self):
+        fc, new, _ = self._fc(run(jf_pgs_cmd(jf_pgs_fc(1280, 720)), sdr1080(),
+                                  slot=False))
+        self.assertNotIn("-hwaccel", new)
+        self.assertIn("[0:0]sand_to_yuv420p_drm=tm=none,scale_v4l2m2m=1280:720,"
+                      "hwdownload,format=yuv420p[main]", fc)
+
+    def test_h264_source(self):
+        probe = stub_probe(codec="h264", w=1920, h=1080, pix_fmt="yuv420p",
+                           bit_depth=8, hdr=False)
+        fc, new, _ = self._fc(run(jf_pgs_cmd(jf_pgs_fc(1280, 720)), probe))
+        self.assertIn("[0:0]scale_v4l2m2m=1280:720,hwdownload,format=yuv420p[main]", fc)
+        self.assertIn("-no_cvt_hw", new)
+
+    def test_4k60_halving_goes_on_the_main_chain(self):
+        fc, _, decision = self._fc(run(jf_pgs_cmd(jf_pgs_fc(1920, 1080)),
+                                       stub_probe(fps=Fraction(60))))
+        self.assertIn("[0:0]fps=30,sand_to_yuv420p_drm=", fc)
+        self.assertIn("hfr=60->30", decision)
+
+    def test_neon_rule_with_halving_keeps_a_main_chain(self):
+        # Empty vf_cpu plus an fps= prefix: the main chain is just fps=.
+        cfg = dict(CFG, hfr_min_pixels=0)
+        fc, _, _ = self._fc(run(jf_pgs_cmd(jf_pgs_fc()),
+                                sdr1080(fps=Fraction(60)), cfg=cfg))
+        self.assertIn(";[0:0]fps=30[main];[main][sub]", fc)
+
+    def test_external_subtitle_input(self):
+        fc_in = jf_pgs_fc().replace("[0:2]", "[1:0]")
+        fc, _, _ = self._fc(run(jf_pgs_cmd(fc_in), sdr1080()))
+        self.assertTrue(fc.startswith("[1:0]scale,"), fc)
+
+    def test_vf_and_filter_complex_together_is_not_rewritten(self):
+        argv = jf_pgs_cmd(jf_pgs_fc()) + ["-vf", "format=yuv420p"]
+        new, decision = run(argv, sdr1080())
+        self.assertNotIn("-hwaccel", new)
+        self.assertIn("encoder-only", decision)
+
+
 class TestEncoderOnlyRedirect(unittest.TestCase):
     """Graphs the hardware graph can't take keep Jellyfin's software filters,
     but a software H.264 encode still moves to the hardware encoder."""
 
-    def test_graphical_subtitle_overlay(self):
-        fc = ("[0:3]scale=1920:1080[sub];[0:0]setparams=colorspace=bt709,"
-              "scale=1920:1080,format=yuv420p[main];[main][sub]overlay=eof_action=pass")
+    def test_unrecognised_filter_complex(self):
+        fc = "[0:0][0:3]overlay=x=10:y=10,format=yuv420p"
         argv = ["-i", "/x.mkv", "-filter_complex", fc, "-codec:v:0", "libx264",
                 "-preset", "veryfast", "-crf", "23", "-maxrate", "8M", "-y", "/o.ts"]
         res = run(argv, sdr1080())
@@ -418,6 +537,14 @@ class TestEncoderOnlyRedirect(unittest.TestCase):
         self.assertNotIn("-crf", new)
         self.assertNotIn("-hwaccel", new)
         self.assertIn("encoder-only", decision)
+
+    def test_deinterlacer_in_the_overlay_main_chain(self):
+        fc = jf_pgs_fc(main="setparams=colorspace=bt709,yadif=0:-1:0,"
+                            "scale=1920:1080,format=yuv420p")
+        new, decision = run(jf_pgs_cmd(fc), sdr1080())
+        self.assertEqual(new[new.index("-filter_complex") + 1], fc)   # untouched
+        self.assertNotIn("-hwaccel", new)
+        self.assertIn("yadif", decision)
 
     def test_deinterlacer(self):
         vf = "yadif=0:-1:0," + jf_vf(1280, 720)

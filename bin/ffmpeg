@@ -40,8 +40,8 @@ _NOREF_BSF = "filter_units=remove_types=0|2|4|6|8|10|12|14|32-63"
 FOREIGN_HW = re.compile(
     r"(?:^|[,;=\s\]])(?:hwupload|hwmap|hwdownload|sand_to_yuv420p_drm|"
     r"scale_v4l2m2m|deinterlace_v4l2m2m)(?:[=,;\s\[]|$)")
-# SW_ONLY — filters our hardware graph cannot reproduce (deinterlacers, a
-# graphical-subtitle overlay). Jellyfin's software graph is kept, but it still
+# SW_ONLY — filters our hardware graph cannot reproduce (deinterlacers, an
+# overlay we didn't recognise). Jellyfin's software graph is kept, but it still
 # ends in plain 8-bit CPU frames, so a software H.264 encode still moves to the
 # hardware encoder: the expensive half of the job leaves the CPU either way.
 SW_ONLY = re.compile(
@@ -50,11 +50,22 @@ SW_ONLY = re.compile(
 # A text-subtitle burn-in. Jellyfin always makes it the LAST filter of its
 # software chain (optionally followed by a setpts), so it is lifted off as a
 # verbatim tail — its quoted, escaped path may contain commas, so it is never
-# split — and re-attached after the hardware graph (see `burn_in` in
-# rules.toml). The classifiers above only look at the part before it, so a
+# split — and re-attached after the hardware graph's CPU-frame form (`vf_cpu`
+# in rules.toml). The classifiers above only look at the part before it, so a
 # subtitle *path* can't trip them.
 _SUBS_TAIL = re.compile(r"(?:^|(?<!\\),)((?:subtitles|ass)=.*)\Z", re.S)
-_DEFAULT_BURN_IN = "hwdownload,format=yuv420p,{subtitles}"
+# A graphical-subtitle (PGS, VobSub, DVB) burn-in. Jellyfin's software path
+# emits exactly this -filter_complex: the subtitle stream rendered onto a canvas
+# the size of the output, the video through its software chain, then overlay:
+#   [0:3]<sub chain>[sub];[0:0]<main chain>[main];[main][sub]overlay=...
+# The main chain is the same one it would put in -vf, so it is classified and
+# replaced exactly like -vf, by the rule's CPU-frame graph (`vf_cpu`); the
+# subtitle chain and the overlay are kept.
+_FC_OVERLAY = re.compile(
+    r"\A(?P<src>\[\d+:\d+\])(?P<sub>[^;\[\]]*)\[sub\];"
+    r"\[0:(?P<v>\d+)\](?:(?P<main>[^;\[\]]*)\[main\];\[main\])?"
+    r"\[sub\](?P<ov>overlay(?:=[^;\[\]]*)?)\Z")
+_DEFAULT_DOWNLOAD = "hwdownload,format=yuv420p"
 
 # The H.264 hardware encoder's size limit. Beyond it the encode fails outright,
 # so an encoder-only redirect is not attempted (the command passes through).
@@ -92,7 +103,7 @@ def parse_argv(argv):
     when absent. Never raises."""
     out = {"input": None, "input_idx": None, "out_codec": None,
            "vf_flag": None, "vf_idx": None, "vf_val": None,
-           "filter_complex": False, "fc_val": None}
+           "filter_complex": False, "fc_idx": None, "fc_val": None}
     i = 0
     n = len(argv)
     while i < n:
@@ -118,11 +129,42 @@ def parse_argv(argv):
         if tok == "-filter_complex":
             out["filter_complex"] = True
             if i + 1 < n:
+                out["fc_idx"] = i
                 out["fc_val"] = argv[i + 1]
                 i += 2
                 continue
         i += 1
     return out
+
+
+def parse_overlay_fc(fc):
+    """Jellyfin's graphical-subtitle -filter_complex split into its parts
+    ({src, sub, v, main, ov}; main is "" in the no-main-chain form), or None if
+    the graph has any other shape."""
+    m = _FC_OVERLAY.match(fc or "")
+    if not m:
+        return None
+    parts = m.groupdict()
+    parts["main"] = parts["main"] or ""
+    return parts
+
+
+def overlay_fc(parts, main, out_w, out_h):
+    """Reassemble the overlay graph around a new main chain. The subtitle canvas
+    is scaled to OUR output size: Jellyfin sized it to its own rounding of the
+    box, which can differ from the hardware path's (/64 width), and overlay
+    would then misplace the subtitles. When the sizes agree, scale passes the
+    frame through untouched."""
+    sub = _join(parts["sub"], "scale=%d:%d:fast_bilinear" % (out_w, out_h))
+    if main:
+        return "%s%s[sub];[0:%s]%s[main];[main][sub]%s" % (
+            parts["src"], sub, parts["v"], main, parts["ov"])
+    return "%s%s[sub];[0:%s][sub]%s" % (parts["src"], sub, parts["v"], parts["ov"])
+
+
+def _join(*chains):
+    """Comma-join filter chains, skipping empty ones."""
+    return ",".join(c for c in chains if c)
 
 
 def _looks_like_file(val):
@@ -364,7 +406,7 @@ def _chroma(pix):
     return "?"
 
 
-def build_facts(p, out_w, out_h, tm, subtitles=None):
+def build_facts(p, out_w, out_h, tm, subtitles=None, overlay=False):
     hw_decodable = (
         p["codec"] == "hevc" and p["chroma"] == "420"
         and p["bit_depth"] in (8, 10)
@@ -387,6 +429,8 @@ def build_facts(p, out_w, out_h, tm, subtitles=None):
         "hw_decodable": hw_decodable,
         "h264_hw_decodable": h264_hw_decodable, "tm": tm,
         "subs": subtitles is not None, "subtitles": subtitles or "",
+        "overlay": bool(overlay),
+        "cpu_out": subtitles is not None or bool(overlay),
     }
 
 
@@ -411,14 +455,19 @@ def choose(cfg, facts, acquire):
                 % rule.get("name"))
             continue
         try:
-            if facts.get("subs") and "vf_subs" in rule:
-                graph = rule["vf_subs"].format(**facts)
-            elif facts.get("subs"):
-                # The rule's graph ends in DRM_PRIME frames; libass draws on CPU
-                # frames, so bring them back, burn in, and hand the encoder
-                # plain yuv420p (h264_v4l2m2m takes either).
-                graph = (rule["vf"].format(**facts) + "," +
-                         cfg.get("burn_in", _DEFAULT_BURN_IN).format(**facts))
+            if facts.get("cpu_out"):
+                # A burn-in draws on CPU frames, so the graph has to end in them.
+                # A rule's graph ends in DRM_PRIME frames, so by default bring
+                # them back (`download`) -- unless the rule says how it gets CPU
+                # frames itself (`vf_cpu`). The encoder takes either.
+                if "vf_cpu" in rule:
+                    graph = rule["vf_cpu"].format(**facts)
+                else:
+                    graph = _join(rule["vf"].format(**facts),
+                                  cfg.get("download", _DEFAULT_DOWNLOAD))
+                # A text subtitle is drawn at the end of the chain; a graphical
+                # one is overlaid after it, by the caller.
+                graph = _join(graph, facts.get("subtitles"))
             else:
                 graph = rule["vf"].format(**facts)
         except Exception as exc:
@@ -428,12 +477,13 @@ def choose(cfg, facts, acquire):
     return None
 
 
-def build_argv(argv, p, hwaccel_args, graph, enc_target=None):
-    """Rewrite: replace the -vf value with `graph`, insert `hwaccel_args`
-    immediately before the primary -i, and (if enc_target is set) swap the video
-    encoder to the hardware one. Everything else is preserved."""
+def build_argv(argv, p, hwaccel_args, graph, enc_target=None, flag_idx=None):
+    """Rewrite: replace the -vf value (or the value of the flag at `flag_idx`)
+    with `graph`, insert `hwaccel_args` immediately before the primary -i, and
+    (if enc_target is set) swap the video encoder to the hardware one.
+    Everything else is preserved."""
     new = list(argv)
-    new[p["vf_idx"] + 1] = graph
+    new[(p["vf_idx"] if flag_idx is None else flag_idx) + 1] = graph
     if enc_target:
         new = rewrite_encoder(new, enc_target)
     if hwaccel_args:
@@ -612,11 +662,16 @@ def decide(argv, cfg, ffprobe_bin, acquire):
         return _passthrough("filter graph already uses hardware frames (%r); "
                             "leaving the whole command alone" % fm.group(0).strip(",;= "))
 
+    overlay = None
     if p["filter_complex"]:
-        return encoder_only(argv, p, ffprobe_bin, enc_target, None,
-                            "-filter_complex graph (e.g. a graphical-subtitle "
-                            "overlay) is not rewritten")
-    if p["vf_flag"] is None:
+        overlay = parse_overlay_fc(p["fc_val"])
+        if overlay is None or p["vf_flag"] is not None:
+            return encoder_only(argv, p, ffprobe_bin, enc_target, None,
+                                "-filter_complex graph is not Jellyfin's "
+                                "graphical-subtitle overlay")
+        # From here on its main chain is treated exactly like a -vf.
+        head, subtitles = overlay["main"], None
+    elif p["vf_flag"] is None:
         return encoder_only(argv, p, ffprobe_bin, enc_target, None, "no -vf")
     sm = SW_ONLY.search(head)
     if sm:
@@ -626,7 +681,8 @@ def decide(argv, cfg, ffprobe_bin, acquire):
     box = extract_box(head) if "scale" in head else None
     if box is None:
         return encoder_only(argv, p, ffprobe_bin, enc_target, None,
-                            "no recognisable scale box in -vf")
+                            "no recognisable scale box in %s"
+                            % ("the overlay's main chain" if overlay else "-vf"))
 
     # NB: deliberately *no* runtime "can the fork provide every encoder this
     # command names?" check here. If the fork is missing one (this bit us with
@@ -649,7 +705,7 @@ def decide(argv, cfg, ffprobe_bin, acquire):
     # 10->8, which washes HDR out. We're emitting 8-bit SDR H.264, so if the probe
     # says the source is HDR, our filter must do the PQ/HLG->SDR conversion itself.
     tm = cfg.get("tm_hdr", "accurate") if pr["hdr"] else "none"
-    facts = build_facts(pr, out_w, out_h, tm, subtitles)
+    facts = build_facts(pr, out_w, out_h, tm, subtitles, overlay is not None)
 
     chosen = choose(cfg, facts, acquire)
     if chosen is None:
@@ -667,8 +723,13 @@ def decide(argv, cfg, ffprobe_bin, acquire):
             # enough survive, don't even decode them.
             if use_noref:
                 hwaccel_args = ["-skip_frame", "noref"] + hwaccel_args
-            graph = "fps=%s,%s" % (target, graph)
-    new_argv = build_argv(argv, p, hwaccel_args, graph, enc_target)
+            graph = _join("fps=%s" % target, graph)
+    if overlay is not None:
+        new_argv = build_argv(argv, p, hwaccel_args,
+                              overlay_fc(overlay, graph, out_w, out_h),
+                              enc_target, flag_idx=p["fc_idx"])
+    else:
+        new_argv = build_argv(argv, p, hwaccel_args, graph, enc_target)
     if hfr_note:
         # A client-requested output -r above the target would re-duplicate the
         # dropped frames (and ask the encoder for a level it can't sustain).
@@ -680,9 +741,14 @@ def decide(argv, cfg, ffprobe_bin, acquire):
     dv_note = (" dv=P%s" % pr["dv"]) if pr.get("dv") else ""
     if subtitles:
         enc_note += " subs=burn-in"
-    decision = ("rule=%r src=%s %dx%d %db %s hdr=%s%s -> out=%dx%d%s vf=%r"
+    elif overlay is not None:
+        enc_note += " subs=overlay"
+    decision = ("rule=%r src=%s %dx%d %db %s hdr=%s%s -> out=%dx%d%s %s=%r"
                 % (name, pr["codec"], pr["w"], pr["h"], pr["bit_depth"],
-                   pr["chroma"], pr["hdr"], dv_note, out_w, out_h, enc_note, graph))
+                   pr["chroma"], pr["hdr"], dv_note, out_w, out_h, enc_note,
+                   "fc" if overlay is not None else "vf",
+                   new_argv[new_argv.index("-filter_complex") + 1]
+                   if overlay is not None else graph))
     return new_argv, decision
 
 
